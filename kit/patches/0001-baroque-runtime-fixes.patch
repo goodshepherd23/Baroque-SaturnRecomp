@@ -1,0 +1,471 @@
+diff --git a/runner/include/runtime_settings.h b/runner/include/runtime_settings.h
+index 96934fe..19de6f5 100644
+--- a/runner/include/runtime_settings.h
++++ b/runner/include/runtime_settings.h
+@@ -15,6 +15,7 @@ typedef struct saturn_runtime_settings {
+     int target_hz;            /* preferred 60..240 Hz, retained when disabled */
+     int volume;               /* 0..100, applied only to host playback */
+     int muted;
++    int widescreen;           /* 0 4:3, 1 16:9 display aspect (anamorphic games) */
+ } saturn_runtime_settings;
+ 
+ void saturn_settings_defaults(saturn_runtime_settings *settings);
+diff --git a/runner/include/saturn.h b/runner/include/saturn.h
+index c285781..6891687 100644
+--- a/runner/include/saturn.h
++++ b/runner/include/saturn.h
+@@ -684,6 +684,11 @@ void scsp_dsp_update_rbp(saturn *s, uint16_t lead);
+ void scsp_dsp_update_rbl(saturn *s, uint16_t len);
+ void smpc_persist_load(saturn *s);
+ void smpc_persist_save(saturn *s);
++void bup_persist_load(saturn *s);
++void bup_persist_tick(saturn *s);
++void bup_persist_flush(saturn *s);
++void cheats_load(saturn *s);
++void cheats_tick(saturn *s);
+ void smpc_padseq_load_env(saturn *s);
+ 
+ void     bus_w8 (saturn *s, uint32_t a, uint8_t  v);
+diff --git a/runner/src/boot.c b/runner/src/boot.c
+index 29ad3b7..2dc4859 100644
+--- a/runner/src/boot.c
++++ b/runner/src/boot.c
+@@ -209,6 +209,8 @@ int main(int argc, char **argv)
+             strcpy(s->smpc_state_path, "smpc.bin");
+         }
+         smpc_persist_load(s);
++        bup_persist_load(s);
++        cheats_load(s);
+     }
+ 
+     if (getenv("SATURN_SMEM")) {
+diff --git a/runner/src/bus.c b/runner/src/bus.c
+index a082bfa..f676cb0 100644
+--- a/runner/src/bus.c
++++ b/runner/src/bus.c
+@@ -2251,6 +2251,8 @@ uint64_t saturn_run_field(saturn *s)
+         }
+     }
+     s->frames++;
++    bup_persist_tick(s);
++    cheats_tick(s);
+     return done;
+ }
+ 
+diff --git a/runner/src/cdblock.c b/runner/src/cdblock.c
+index 4857e5b..39cdd9c 100644
+--- a/runner/src/cdblock.c
++++ b/runner/src/cdblock.c
+@@ -1669,6 +1669,35 @@ void cdb_execute(saturn *s)
+                 (uint16_t)(cd->calc_words & 0xFFFF), 0, 0);
+         hirq_set(s, HIRQ_ESEL);
+         break;
++    case 0x54: { /* GetSectorInfo: CR2 low byte = sector offset, CR3 high
++                  * byte = partition. Answers that sector's FAD and its Mode 2
++                  * subheader (file, channel, submode, coding; zero on Mode 1),
++                  * per Ymir CmdGetSectorInfo / Mednafen. It had no handler: the
++                  * default status reply carried the drive's current FAD, so a
++                  * loader that verifies the FAD of what it buffered (Baroque's
++                  * sound-driver load) saw a mismatch and re-read forever. */
++        unsigned p = PNUM(cr3);
++        uint32_t off = cr2 & 0xFFu;
++        if (off >= cd->part_sectors[p]) {
++            respond(s, (uint16_t)(ST_REJECT << 8), 0, 0, 0);
++            break;
++        }
++        {
++            uint32_t fad = cd->part_fad[p][off];
++            uint8_t raw[2352], file = 0, chan = 0, sub = 0, coding = 0;
++            if (cd->disc && fad >= FAD_BASE &&
++                disc_read_raw((disc *)cd->disc, fad - FAD_BASE, raw) == 0 &&
++                raw[15] == 2) {
++                file = raw[16]; chan = raw[17]; sub = raw[18]; coding = raw[19];
++            }
++            respond(s, (uint16_t)((cd->status << 8) | ((fad >> 16) & 0xFF)),
++                    (uint16_t)(fad & 0xFFFF),
++                    (uint16_t)((file << 8) | chan),
++                    (uint16_t)((sub << 8) | coding));
++        }
++        hirq_set(s, HIRQ_ESEL);
++        break;
++    }
+ 
+     case 0x70:  /* ChangeDirectory: scan the named directory. A fresh scan
+                  * puts the file cursor at the first real entry -- ids 0 and 1
+diff --git a/runner/src/runtime_settings.c b/runner/src/runtime_settings.c
+index 5511bf4..d4f9a37 100644
+--- a/runner/src/runtime_settings.c
++++ b/runner/src/runtime_settings.c
+@@ -19,7 +19,8 @@ static const setting_key keys[]={
+     KEY("Fullscreen",0,fullscreen),KEY("InternalScale",0,internal_scale),
+     KEY("TextureFilter",0,texture_filter),KEY("Antialiasing",0,antialiasing),
+     KEY("ModelSmoothing",0,model_smoothing),KEY("Interpolation",0,interpolation),
+-    KEY("TargetHz",0,target_hz),KEY("Volume",1,volume),KEY("Muted",1,muted)
++    KEY("TargetHz",0,target_hz),KEY("Volume",1,volume),KEY("Muted",1,muted),
++    KEY("Widescreen",0,widescreen)
+ };
+ enum {KEY_COUNT=sizeof keys/sizeof *keys,INTERPOLATION_KEY=7,TARGET_KEY=8};
+ static const char *sections[]={"Video","Audio"};
+@@ -27,7 +28,7 @@ static const char *sections[]={"Video","Audio"};
+ static int clamp(int n,int low,int high) {return n<low?low:n>high?high:n;}
+ void saturn_settings_defaults(saturn_runtime_settings *s) {
+     if(!s)return;
+-    *s=(saturn_runtime_settings){960,720,0,1,0,0,0,0,120,100,0};
++    *s=(saturn_runtime_settings){960,720,0,1,0,0,0,0,120,100,0,0};
+ }
+ void saturn_settings_normalize(saturn_runtime_settings *s) {
+     if(!s)return;
+@@ -35,7 +36,7 @@ void saturn_settings_normalize(saturn_runtime_settings *s) {
+     s->window_height=clamp(s->window_height,SATURN_MIN_WINDOW_HEIGHT,4320);
+     s->internal_scale=clamp(s->internal_scale,1,4);
+     s->target_hz=clamp(s->target_hz,60,240);s->volume=clamp(s->volume,0,100);
+-    s->fullscreen=!!s->fullscreen;s->interpolation=!!s->interpolation;s->muted=!!s->muted;
++    s->fullscreen=!!s->fullscreen;s->interpolation=!!s->interpolation;s->muted=!!s->muted;s->widescreen=!!s->widescreen;
+     s->texture_filter=clamp(s->texture_filter,0,1);
+     s->antialiasing=clamp(s->antialiasing,0,1);
+     s->model_smoothing=clamp(s->model_smoothing,0,1);
+diff --git a/runner/src/sh2_interp.c b/runner/src/sh2_interp.c
+index ef870ee..d2785f4 100644
+--- a/runner/src/sh2_interp.c
++++ b/runner/src/sh2_interp.c
+@@ -650,10 +650,16 @@ static int take_interrupt(sh2 *c)
+      * returning here on the strength of it skipped the slave's dmac_pending()
+      * check entirely, so a slave DMA transfer-end interrupt was only ever
+      * serviced when the SCU happened to have something deliverable queued. */
++    /* The master has on-chip sources too. Returning on the SCU mask alone
++     * starved its DMAC transfer-end interrupt the same way: Baroque arms
++     * CHCR0.IE at level 1 for a WRAM-L -> VDP2 copy and spins until vector
++     * 0x6D runs, which then happened only if no SCU source was deliverable
++     * at a scan -- never, so entering the game world hung on a black screen. */
+     if (!c->is_slave && !c->frt_pend) {
+         uint32_t m = s->scu_reg[0xA0 >> 2];
+         if (!(s->scu_ipend & 0x3FFFu & ~m) &&
+-            (!(s->scu_ipend >> 16) || (m & 0x10000u))) return 0;
++            (!(s->scu_ipend >> 16) || (m & 0x10000u)) &&
++            !dmac_pending(c, c->sr, &vector, &level)) return 0;
+     }
+ 
+     /* The SCU drives the MASTER SH-2's interrupt lines. The slave has no
+@@ -1964,9 +1970,11 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
+                 may_fast = !c->frt_pend && !dmac_pending(c, c->sr, &fvec, &flvl);
+             } else {
+                 uint32_t m = s->scu_reg[0xA0 >> 2];
++                int fvec, flvl;
+                 may_fast = !c->frt_pend &&
+                            !(s->scu_ipend & 0x3FFFu & ~m) &&
+-                           (!(s->scu_ipend >> 16) || (m & 0x10000u));
++                           (!(s->scu_ipend >> 16) || (m & 0x10000u)) &&
++                           !dmac_pending(c, c->sr, &fvec, &flvl);
+             }
+             if (may_fast) {
+                 uint32_t pc = c->pc;
+diff --git a/runner/src/smpc.c b/runner/src/smpc.c
+index 390ccb5..5a8dbeb 100644
+--- a/runner/src/smpc.c
++++ b/runner/src/smpc.c
+@@ -12,7 +12,12 @@
+  * without ever producing data leaves a game waiting forever for input that
+  * never arrives.
+  */
++#ifdef _WIN32
++#include <windows.h>
++#endif
+ #include "saturn.h"
++#include "sh2_cache.h"
++#include <ctype.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+@@ -805,6 +810,191 @@ void smpc_persist_save(saturn *s)
+     fclose(f);
+ }
+ 
++/* Internal backup RAM persistence. saturn_init formats a fresh BUP on every
++ * boot, so a game's saves vanished when the window closed. The image lives
++ * in backup.bin beside the game's declaration (SATURN_BUPFILE overrides).
++ * Writes are debounced: a BUP library updates several blocks across a few
++ * fields, so the file is written once the contents have changed and then
++ * held still for one check interval, and again at shutdown. Only a frontend
++ * that called bup_persist_load persists anything. */
++static int     bup_enabled;
++static int     bup_pending;
++static uint8_t bup_shadow[BUP_SIZE];
++static char    bup_path[512];
++
++static void bup_write(saturn *s)
++{
++    char tmp[530];
++    FILE *f;
++    snprintf(tmp, sizeof tmp, "%s.tmp", bup_path);
++    f = fopen(tmp, "wb");
++    if (!f) return;
++    if (fwrite(s->bup, 1, BUP_SIZE, f) != BUP_SIZE) { fclose(f); remove(tmp); return; }
++    if (fclose(f) != 0) { remove(tmp); return; }
++#ifdef _WIN32
++    MoveFileExA(tmp, bup_path, MOVEFILE_REPLACE_EXISTING);
++#else
++    rename(tmp, bup_path);
++#endif
++}
++
++void bup_persist_load(saturn *s)
++{
++    const char *e = getenv("SATURN_BUPFILE");
++    FILE *f;
++    if (e && *e) {
++        snprintf(bup_path, sizeof bup_path, "%s", e);
++    } else {
++        /* smpc_state_path is "<game dir>/smpc.bin" or bare "smpc.bin". */
++        const char *sp = s->smpc_state_path;
++        const char *slash = strrchr(sp, '/'), *bslash = strrchr(sp, '\\');
++        const char *cut = slash > bslash ? slash : bslash;
++        size_t dirlen = cut ? (size_t)(cut - sp) + 1 : 0;
++        if (dirlen >= sizeof bup_path - 16) dirlen = 0;
++        memcpy(bup_path, sp, dirlen);
++        strcpy(bup_path + dirlen, "backup.bin");
++    }
++    f = fopen(bup_path, "rb");
++    if (f) {
++        static uint8_t buf[BUP_SIZE];
++        if (fread(buf, 1, BUP_SIZE, f) == BUP_SIZE) memcpy(s->bup, buf, BUP_SIZE);
++        fclose(f);
++    }
++    memcpy(bup_shadow, s->bup, BUP_SIZE);
++    bup_pending = 0;
++    bup_enabled = 1;
++}
++
++void bup_persist_tick(saturn *s)
++{
++    if (!bup_enabled || s->frames % 30u) return;
++    if (memcmp(bup_shadow, s->bup, BUP_SIZE) != 0) {
++        memcpy(bup_shadow, s->bup, BUP_SIZE);
++        bup_pending = 1;
++    } else if (bup_pending) {
++        bup_write(s);
++        bup_pending = 0;
++    }
++}
++
++void bup_persist_flush(saturn *s)
++{
++    if (!bup_enabled) return;
++    if (bup_pending || memcmp(bup_shadow, s->bup, BUP_SIZE) != 0) {
++        memcpy(bup_shadow, s->bup, BUP_SIZE);
++        bup_write(s);
++        bup_pending = 0;
++    }
++}
++
++/* Action Replay / GameShark codes. cheats.txt beside the game's declaration
++ * (SATURN_CHEATFILE overrides) holds named groups of codes:
++ *
++ *     + Infinite HP        <- "+" enables the codes below it, "-" disables
++ *     16098D4E FFFF
++ *
++ * Saturn Action Replay types: 1AAAAAAA VVVV writes 16 bits, 3AAAAAAA 00VV
++ * writes 8 bits, DAAAAAAA VVVV runs the next code only if the 16-bit value
++ * at A equals V. F/B master codes install the cartridge's hook; there is no
++ * cartridge here, so they are accepted and skipped. Codes are applied once
++ * per field, like the cartridge's V-Blank hook, as master-CPU writes so the
++ * caches stay coherent; the file is re-read when it changes, so cheats can be
++ * toggled while the game runs. */
++#include <sys/stat.h>
++typedef struct { uint8_t type; uint32_t addr; uint16_t val; } ar_code;
++static ar_code ar_codes[1024];
++static int     ar_count, ar_active;
++static char    ar_path[512];
++static long long ar_stamp = -1;
++
++static long long ar_file_stamp(void)
++{
++    struct stat st;
++    if (stat(ar_path, &st) != 0) return -1;
++    return (long long)st.st_mtime * 1000003LL + (long long)st.st_size;
++}
++
++static void ar_parse(void)
++{
++    char line[512];
++    int on = 0, groups = 0, skipped = 0;
++    FILE *f = fopen(ar_path, "r");
++    ar_count = 0;
++    if (!f) return;
++    while (fgets(line, sizeof line, f)) {
++        char *p = line;
++        unsigned long a, v;
++        while (*p == ' ' || *p == '\t') p++;
++        if (*p == '+' || *p == '-') { on = *p == '+'; groups += on; continue; }
++        if (!on || !isxdigit((unsigned char)*p)) continue;
++        for (char *q = p; *q; q++) if (*q == ':') *q = ' ';
++        if (sscanf(p, "%8lx %4lx", &a, &v) != 2) continue;
++        unsigned type = (unsigned)(a >> 28);
++        if (type != 1 && type != 3 && type != 0xD) { skipped += type != 0xF && type != 0xB; continue; }
++        if (ar_count >= (int)(sizeof ar_codes / sizeof *ar_codes)) break;
++        ar_codes[ar_count].type = (uint8_t)type;
++        ar_codes[ar_count].addr = (uint32_t)(a & 0x0FFFFFFFu);
++        ar_codes[ar_count].val  = (uint16_t)v;
++        ar_count++;
++    }
++    fclose(f);
++    fprintf(stderr, "[cheats] %d code(s) active in %d enabled cheat(s)%s\n",
++            ar_count, groups, skipped ? " (unsupported code types skipped)" : "");
++}
++
++void cheats_load(saturn *s)
++{
++    const char *e = getenv("SATURN_CHEATFILE");
++    if (e && *e) {
++        snprintf(ar_path, sizeof ar_path, "%s", e);
++    } else {
++        const char *sp = s->smpc_state_path;
++        const char *slash = strrchr(sp, '/'), *bslash = strrchr(sp, '\\');
++        const char *cut = slash > bslash ? slash : bslash;
++        size_t dirlen = cut ? (size_t)(cut - sp) + 1 : 0;
++        if (dirlen >= sizeof ar_path - 16) dirlen = 0;
++        memcpy(ar_path, sp, dirlen);
++        strcpy(ar_path + dirlen, "cheats.txt");
++    }
++    ar_stamp = ar_file_stamp();
++    ar_parse();
++    ar_active = 1;
++}
++
++static void ar_write(saturn *s, uint32_t a, uint16_t v, unsigned size)
++{
++    sh2 *save = s->cur;
++    s->cur = &s->master;
++    if (size == 1) bus_w8(s, a, (uint8_t)v); else bus_w16(s, a & ~1u, v);
++    s->cur = save;
++    sh2_cache_write(&s->slave, size == 1 ? a : (a & ~1u), v, size);
++}
++
++void cheats_tick(saturn *s)
++{
++    int skip = 0;
++    if (!ar_active) return;
++    if (s->frames % 60u == 0) {
++        long long stamp = ar_file_stamp();
++        if (stamp != ar_stamp) { ar_stamp = stamp; ar_parse(); }
++    }
++    for (int i = 0; i < ar_count; i++) {
++        const ar_code *c = &ar_codes[i];
++        if (skip) { skip = 0; continue; }
++        switch (c->type) {
++        case 0x1: ar_write(s, c->addr, c->val, 2); break;
++        case 0x3: ar_write(s, c->addr, c->val & 0xFFu, 1); break;
++        case 0xD: {
++            sh2 *save = s->cur;
++            s->cur = &s->master;
++            skip = bus_r16(s, c->addr & ~1u) != c->val;
++            s->cur = save;
++            break;
++        }
++        }
++    }
++}
++
+ void smpc_reset(saturn *s)
+ {
+     memset(s->smpc_reg, 0, sizeof(s->smpc_reg));
+diff --git a/runner/src/vulkan_renderer.c b/runner/src/vulkan_renderer.c
+index 601610e..45f8937 100644
+--- a/runner/src/vulkan_renderer.c
++++ b/runner/src/vulkan_renderer.c
+@@ -739,7 +739,9 @@ int saturn_vk_render(saturn_vk_renderer *r, saturn *s, int width, int height,
+     image_barrier(r->command,output,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
+     image_barrier(r->command,r->swap_images[image_index],VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,0,VK_ACCESS_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
+     VkClearColorValue black={{0,0,0,1}};VkImageSubresourceRange sr={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};vkCmdClearColorImage(r->command,r->swap_images[image_index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&black,1,&sr);
+-    int outw=(int)r->swap_extent.width,outh=(int)r->swap_extent.height,x0=0,y0=0,x1=outw,y1=outh;if(outw*3<=outh*4){y1=outw*3/4;y0=(outh-y1)/2;y1+=y0;}else{x1=outh*4/3;x0=(outw-x1)/2;x1+=x0;}
++    /* Display aspect: the Saturn's 4:3, or 16:9 for games with an anamorphic widescreen mode. */
++    int aw=r->quality.widescreen?16:4,ah=r->quality.widescreen?9:3;
++    int outw=(int)r->swap_extent.width,outh=(int)r->swap_extent.height,x0=0,y0=0,x1=outw,y1=outh;if(outw*ah<=outh*aw){y1=outw*ah/aw;y0=(outh-y1)/2;y1+=y0;}else{x1=outh*aw/ah;x0=(outw-x1)/2;x1+=x0;}
+     VkImageBlit bl={0};bl.srcSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;bl.srcSubresource.layerCount=1;bl.srcOffsets[1].x=width*(int)internal_scale;bl.srcOffsets[1].y=height*(int)internal_scale;bl.srcOffsets[1].z=1;bl.dstSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;bl.dstSubresource.layerCount=1;bl.dstOffsets[0].x=x0;bl.dstOffsets[0].y=y0;bl.dstOffsets[1].x=x1;bl.dstOffsets[1].y=y1;bl.dstOffsets[1].z=1;
+     vkCmdBlitImage(r->command,output,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,r->swap_images[image_index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&bl,VK_FILTER_NEAREST);
+     image_barrier(r->command,output,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,VK_ACCESS_TRANSFER_READ_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+diff --git a/runner/src/window.c b/runner/src/window.c
+index e923992..981e5f0 100644
+--- a/runner/src/window.c
++++ b/runner/src/window.c
+@@ -586,8 +586,16 @@ int main(int argc, char **argv)
+             strcpy(s->smpc_state_path, "smpc.bin");
+         }
+         smpc_persist_load(s);
++        bup_persist_load(s);
++        cheats_load(s);
+     }
+     smpc_padseq_load_env(s);
++    /* SATURN_DUMPAT parity with saturnboot: a stall reached only through
++     * live pad input needs the windowed runner to take the capture. */
++    if (getenv("SATURN_DUMPAT"))
++        s->dumpat_pc = (uint32_t)strtoul(getenv("SATURN_DUMPAT"), NULL, 0);
++    s->dumpat_n = getenv("SATURN_DUMPAT_N") ? atoi(getenv("SATURN_DUMPAT_N")) : 1;
++    if (s->dumpat_n < 1) s->dumpat_n = 1;
+     if (g.bios[0] && !no_bios) {
+         char err[256];
+         if (bios_rom_load(s, g.bios, err, sizeof(err)) != 0) {
+@@ -773,6 +781,17 @@ int main(int argc, char **argv)
+         fprintf(stderr, "[settings] fullscreen unavailable: %s\n", SDL_GetError());
+         settings.fullscreen = 0;
+     }
++    /* A launcher that starts us through a windowless entry program leaves
++     * Windows' foreground lock with the launcher: our window can appear on top
++     * yet never receive keyboard focus, so every key goes to the launcher.
++     * Take focus now, and keep asking for a few seconds (see the main loop)
++     * until it is granted once -- never after, so alt-tab is not fought. */
++    uint64_t focus_claim_until = 0, focus_claim_next = 0;
++    if (!(SDL_GetWindowFlags(win) & SDL_WINDOW_HIDDEN)) {   /* never for hidden test runs */
++        SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "1");
++        SDL_RaiseWindow(win);
++        focus_claim_until = SDL_GetTicks64() + 5000;
++    }
+     if (use_vk) {
+         if (!saturn_vk_set_quality(vk, &settings, vk_error, sizeof vk_error)) {
+             fprintf(stderr, "[video] saved rendering options unavailable: %s\n", vk_error);
+@@ -872,6 +891,18 @@ int main(int argc, char **argv)
+         uint64_t emu_begin = 0, emu_end = 0, render_end = 0;
+         uint64_t present_begin = 0, present_end = 0;
+ 
++        if (focus_claim_until) {
++            uint64_t now_ms = SDL_GetTicks64();
++            if (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) {
++                focus_claim_until = 0;
++            } else if (now_ms >= focus_claim_until) {
++                fprintf(stderr, "[window] keyboard focus was not granted at startup\n");
++                focus_claim_until = 0;
++            } else if (now_ms >= focus_claim_next) {
++                SDL_RaiseWindow(win);
++                focus_claim_next = now_ms + 250;
++            }
++        }
+         if (overlay_input) game_overlay_input_begin(overlay);
+         while (SDL_PollEvent(&e)) {
+             if (e.type == SDL_QUIT) running = 0;
+@@ -1144,10 +1175,14 @@ int main(int argc, char **argv)
+                 SDL_GetRendererOutputSize(ren, &ww, &wh);
+                 if (g_debug) {
+                     dst.x = dst.y = 0; dst.w = ww; dst.h = wh;
+-                } else if (ww * 3 <= wh * 4) {      /* window taller than 4:3 */
+-                    dst.w = ww; dst.h = ww * 3 / 4;
+-                } else {                            /* window wider than 4:3 */
+-                    dst.h = wh; dst.w = wh * 4 / 3;
++                } else {
++                    /* Widescreen presents anamorphic 16:9 output at 16:9. */
++                    int aw = settings.widescreen ? 16 : 4, ah = settings.widescreen ? 9 : 3;
++                    if (ww * ah <= wh * aw) {        /* window taller than the aspect */
++                        dst.w = ww; dst.h = ww * ah / aw;
++                    } else {                         /* window wider than the aspect */
++                        dst.h = wh; dst.w = wh * aw / ah;
++                    }
+                 }
+                 if (!g_debug) { dst.x = (ww - dst.w) / 2; dst.y = (wh - dst.h) / 2; }
+                 SDL_RenderCopy(ren, show, NULL, &dst);
+@@ -1327,6 +1362,8 @@ int main(int argc, char **argv)
+     fprintf(stderr, "[runtime] fields %llu cycles %llu\n",
+             (unsigned long long)s->frames, (unsigned long long)s->master.cycles);
+     saturn_report_trace(s, stdout);
++    bup_persist_flush(s);
++    mem_dump_now(s);   /* SATURN_MEMDUMP end-of-run capture, as in saturnboot */
+ 
+     if (audio_dev) SDL_CloseAudioDevice(audio_dev);
+     diagnostics_close(&diagnostics);

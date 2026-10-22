@@ -1,0 +1,8 @@
+dist/
+kit/setup.log
+# never commit game data, firmware or saves
+*.bin
+!kit/game/console.bin
+*.cue
+*.iso
+backup.bin

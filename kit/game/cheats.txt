@@ -1,0 +1,38 @@
+# Baroque (Japan, T-33901G) - Action Replay / GameShark codes
+#
+# Turn a cheat ON by changing the "-" in front of its name to "+",
+# and OFF by changing it back to "-". Save the file; the game picks the
+# change up within about a second, even while it is running.
+#
+# Supported: 1AAAAAAA VVVV (16-bit write), 3AAAAAAA 00VV (8-bit write),
+# DAAAAAAA VVVV (only run the next line if the value equals VVVV).
+# F/B master codes are accepted and ignored - no cartridge is needed.
+# You can paste in more codes from any Saturn Action Replay list.
+
+# Master code (not needed here, kept for reference)
+- Master code
+F9000924 FFFF
+B6002800 0000
+
+# HP stays at 999 (current and maximum). Checked against this disc.
+- Infinite HP
+16098D54 03E7
+16098D56 03E7
+
+# VT (vitality) stays at 99, so it never drains. Checked against this disc.
+- Infinite VT
+16098D58 0063
+
+# From almarsguides.com: experience pinned high, so you level up fast.
+- Faster level ups / max EXP
+16098D4E FFFF
+
+# From almarsguides.com: HP, VT and two stats all set to 999.
+# Note: this also raises VT to 999, which overflows the VT display.
+- Max status
+16098D54 03E7
+16098D56 03E7
+16098D58 03E7
+16098D5A 03E7
+16098D5C 03E7
+16098D5E 03E7

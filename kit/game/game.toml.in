@@ -1,0 +1,17 @@
+# Baroque (Japan, T-33901G) on the SaturnRecomp runtime.
+# setup.ps1 writes game.toml from this template with the disc you chose.
+[game]
+name       = "Baroque"
+prefix     = "baroque"
+product_no = "T-33901G"
+disc       = "@DISC@"
+bios       = "../bios/saturn.bin"   # your own Saturn BIOS dump (JP recommended)
+
+[[module]]
+name        = "main"
+file        = "/AAA.BIN"
+cpu         = "sh2"
+compression = "none"
+load_addr   = 0x06004000
+entry       = 0x06004000
+first_read  = true
