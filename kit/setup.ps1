@@ -113,7 +113,7 @@ if (-not $Rebuild -and (Test-Path -LiteralPath "$runtime\saturnwin.exe") -and (T
 }
 
 # ---------------------------------------------------------------- toolchain
-Step 'Build tools (portable MSYS2, about 600 MB, kept in tools\)'
+Step 'Build tools (portable MSYS2, about 1 GB, kept in tools\)'
 $marker = "$tools\.packages"
 if (-not (Test-Path -LiteralPath "$mingw\gcc.exe") -or -not (Test-Path -LiteralPath $marker) -or
     (Get-Content -LiteralPath $marker -Raw).Trim() -ne $Packages) {

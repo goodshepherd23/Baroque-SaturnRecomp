@@ -47,7 +47,7 @@ On first launch a setup window opens:
 
 1. It asks for your Saturn BIOS, then your Baroque `.cue` file, and checks both.
    It reads the disc's header to confirm it is Baroque, T-33901G.
-2. It downloads a portable copy of MSYS2 (the GCC compiler, about 600 MB, kept in
+2. It downloads a portable copy of MSYS2 (the GCC compiler, about 1 GB, kept in
    `tools\`). The download is verified by checksum.
 3. It downloads SaturnRecomp at a fixed commit (`26c9715`), applies this kit's
    patches, and builds the runtime. That takes about 5 to 10 minutes.
