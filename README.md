@@ -70,6 +70,18 @@ runtime, run `Baroque.exe --rebuild`.
 **Esc** quits. The game starts fullscreen. Turn that off in F1 or with
 `Fullscreen=0` in `settings.ini`.
 
+## Higher resolution
+
+**F1 > Graphics > Internal resolution** renders the game at up to **8x** the
+Saturn's resolution. Plain SaturnRecomp stops at 4x. **6x** draws Baroque at
+2112 x 1344, about 1440p, with much sharper walls and polygon edges. The 2D
+HUD keeps its original artwork. You can also set `InternalScale=6` in
+`settings.ini`.
+
+Higher scales cost GPU time. On integrated graphics, which share power with
+the CPU, 6x needed the launcher's Best performance switch to stay at full
+speed in testing. Drop to 4x if you see slowdown.
+
 ## Widescreen
 
 Baroque has a built-in anamorphic widescreen mode for 16:9 TVs. To use it:
@@ -119,6 +131,7 @@ are in `kit\patches` and were offered back to the author in
 - **Backup RAM was never saved.** In-game saves were lost on exit.
 - **Keyboard focus** when the game is started from a launcher.
 - **A `Widescreen` setting** for 16:9 presentation.
+- **Internal resolution up to 8x** (was 4x).
 - **Action Replay code support** (`cheats.txt`).
 - Two small diagnostics improvements.
 
