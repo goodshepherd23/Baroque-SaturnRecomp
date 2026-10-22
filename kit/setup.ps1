@@ -4,10 +4,14 @@
 # with the Baroque fixes applied, and points it at YOUR disc and BIOS. Nothing
 # from SaturnRecomp, the BIOS or the game is shipped in this kit.
 #
-# Run by Baroque.exe when needed; safe to re-run. Everything it downloads stays
-# inside the game folder (tools\, build\, runtime\).
+# Run by Baroque.exe when needed; safe to re-run. -Root is the app folder (the
+# one with kit\). Your files and everything setup downloads (game\, bios\,
+# settings.ini, tools\, build\, runtime\) go in -Data, which Baroque.exe sets to
+# %LOCALAPPDATA%\Baroque-SaturnRecomp so app updates leave them alone. Without
+# -Data they stay in the app folder.
 param(
     [Parameter(Mandatory = $true)][string]$Root,
+    [string]$Data,
     [string]$Disc,
     [string]$Bios,
     [switch]$Rebuild
@@ -17,6 +21,9 @@ $ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest crawls with a pro
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $Root = (Resolve-Path -LiteralPath $Root).Path
+if (-not $Data) { $Data = $Root }
+New-Item -ItemType Directory -Force -Path $Data | Out-Null
+$Data = (Resolve-Path -LiteralPath $Data).Path
 $KitVersion   = (Get-Content -LiteralPath "$Root\kit\kit-version.txt" -Raw).Trim()   # not version.txt: Quiver owns that file
 $SaturnCommit = '26c9715e5493054b8a205aa31d73d8f125fdd8f5'
 $SaturnZip    = "https://codeload.github.com/sonsegajp/SaturnRecomp/zip/$SaturnCommit"
@@ -25,17 +32,17 @@ $MsysSha256   = 'ad336cccfda47758b5e15cda993fbba421115cb0b126697daef1ee4dfe37209
 $Packages     = 'mingw-w64-x86_64-gcc mingw-w64-x86_64-SDL2 mingw-w64-x86_64-vulkan-headers mingw-w64-x86_64-vulkan-loader mingw-w64-x86_64-shaderc patch'
 
 $kit     = "$Root\kit"
-$tools   = "$Root\tools"
+$tools   = "$Data\tools"
 $msys    = "$tools\msys64"
 $bash    = "$msys\usr\bin\bash.exe"
 $mingw   = "$msys\mingw64\bin"
-$build   = "$Root\build"
+$build   = "$Data\build"
 $src     = "$build\SaturnRecomp"
-$runtime = "$Root\runtime"
-$game    = "$Root\game"
+$runtime = "$Data\runtime"
+$game    = "$Data\game"
 
-New-Item -ItemType Directory -Force -Path $tools, $build, $runtime, $game, "$Root\bios" | Out-Null
-Start-Transcript -LiteralPath "$kit\setup.log" -Force | Out-Null
+New-Item -ItemType Directory -Force -Path $tools, $build, $runtime, $game, "$Data\bios" | Out-Null
+Start-Transcript -LiteralPath "$Data\setup.log" -Force | Out-Null
 
 function Step([string]$m) { Write-Host ''; Write-Host "== $m" -ForegroundColor Cyan }
 # Native tools write warnings to stderr (MSYS2 complains about some time zones);
@@ -53,7 +60,7 @@ function Pick-File([string]$title, [string]$filter) {
 
 # ---------------------------------------------------------------- game data
 Step 'Your Saturn BIOS'
-$biosDst = "$Root\bios\saturn.bin"
+$biosDst = "$Data\bios\saturn.bin"
 if (-not $Bios -and -not (Test-Path -LiteralPath $biosDst)) {
     Write-Host 'Choose your own 512 KB Sega Saturn BIOS dump (a Japanese BIOS is recommended for Baroque).'
     $Bios = Pick-File 'Choose your Sega Saturn BIOS (512 KB)' 'Saturn BIOS (*.bin)|*.bin|All files (*.*)|*.*'
@@ -86,7 +93,7 @@ if (-not $Disc -and (Test-Path -LiteralPath $toml)) {
     if ($m) { $existing = $m.Matches[0].Groups[1].Value -replace '/', '\'; if (Test-Path -LiteralPath $existing) { $Disc = $existing } }
 }
 if (-not $Disc) {
-    $local = Get-ChildItem -LiteralPath "$Root\disc" -Filter *.cue -ErrorAction SilentlyContinue | Select-Object -First 1
+    $local = Get-ChildItem -LiteralPath "$Root\disc", "$Data\disc" -Filter *.cue -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($local) { $Disc = $local.FullName }
 }
 if (-not $Disc) {
@@ -103,7 +110,7 @@ Write-Host "Disc: $Disc"
 foreach ($f in 'cheats.txt', 'console.bin') {
     if (-not (Test-Path -LiteralPath "$game\$f")) { Copy-Item -LiteralPath "$kit\game\$f" -Destination "$game\$f" }
 }
-if (-not (Test-Path -LiteralPath "$Root\settings.ini")) { Copy-Item -LiteralPath "$kit\game\settings.ini" -Destination "$Root\settings.ini" }
+if (-not (Test-Path -LiteralPath "$Data\settings.ini")) { Copy-Item -LiteralPath "$kit\game\settings.ini" -Destination "$Data\settings.ini" }
 
 $stamp = "$runtime\.kit-version"
 if (-not $Rebuild -and (Test-Path -LiteralPath "$runtime\saturnwin.exe") -and (Test-Path -LiteralPath $stamp) -and
@@ -148,7 +155,7 @@ Move-Item -LiteralPath "$tmp\SaturnRecomp-$SaturnCommit" -Destination $src
 Remove-Item -LiteralPath $tmp, $zip -Recurse -Force
 Write-Host 'Applying the Baroque fixes...'
 foreach ($p in Get-ChildItem -LiteralPath "$kit\patches" -Filter *.patch | Sort-Object Name) {
-    Native { & "$msys\usr\bin\patch.exe" -p1 --forward --no-backup-if-mismatch -d $src -i $p.FullName }
+    Native { & "$msys\usr\bin\patch.exe" -p1 --forward --no-backup-if-mismatch -d $src -i $p.FullName 2>&1 | ForEach-Object { "$_" } }
     if ($LASTEXITCODE -ne 0) { Fail "Patch $($p.Name) did not apply." }
 }
 
@@ -176,7 +183,7 @@ try {
         Native { & powershell -NoProfile -ExecutionPolicy Bypass -File "$src\tools\build_runtime.ps1" -Profile off 2>&1 | Select-Object -Last 3 | ForEach-Object { "$_" } }
     } else { Write-Host 'Optimized (PGO) build OK.' }
 } finally { Pop-Location }
-if (-not (Test-Path -LiteralPath "$src\out\runtime-build\saturnwin.exe")) { Fail 'The runtime did not build. See kit\setup.log.' }
+if (-not (Test-Path -LiteralPath "$src\out\runtime-build\saturnwin.exe")) { Fail "The runtime did not build. See $Data\setup.log." }
 
 # ---------------------------------------------------------------- install
 Step 'Installing'

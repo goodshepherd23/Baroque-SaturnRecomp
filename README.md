@@ -22,7 +22,8 @@ launcher, and settings that make it pleasant to play on a laptop.
 - **Full speed (60 fps)** on a 15 W Intel i7-1355U laptop when plugged in. Battery
   play benefits from the power-mode switch below, but hasn't been measured in
   gameplay.
-- **Saves**: Saturn internal backup RAM is kept in `game\backup.bin`.
+- **Saves**: Saturn internal backup RAM is kept in `game\backup.bin` in your
+  [data folder](#where-your-files-live), outside the app folder.
 - **Widescreen**: Baroque's own 16:9 mode, displayed correctly (see below).
 - **Action Replay / GameShark codes** (see below).
 - Keyboard and SDL-compatible controllers.
@@ -48,7 +49,7 @@ On first launch a setup window opens:
 1. It asks for your Saturn BIOS, then your Baroque `.cue` file, and checks both.
    It reads the disc's header to confirm it is Baroque, T-33901G.
 2. It downloads a portable copy of MSYS2 (the GCC compiler, about 1 GB, kept in
-   `tools\`). The download is verified by checksum.
+   `tools\` in the data folder). The download is verified by checksum.
 3. It downloads SaturnRecomp at a fixed commit (`26c9715`), applies this kit's
    patches, and builds the runtime. That takes about 5 to 10 minutes.
 4. The game starts. Later launches start straight away.
@@ -87,15 +88,15 @@ speed in testing. Drop to 4x if you see slowdown.
 Baroque has a built-in anamorphic widescreen mode for 16:9 TVs. To use it:
 
 1. In the game, go to **Settings > TV Type** and choose **Wide**. The game keeps this in your save.
-2. In `settings.ini` (in the game folder), set `Widescreen=1`.
+2. In `settings.ini` (in the data folder), set `Widescreen=1`.
 
 The dungeon then shows a wider view at correct proportions. Menus and movies
 look stretched in this mode, exactly as they did on a widescreen TV.
 
 ## Cheats
 
-Edit `game\cheats.txt`. Change the `-` in front of a cheat's name to `+` to turn
-it on. The file is re-read while the game runs. Included, all off by default:
+Edit `game\cheats.txt` in the data folder. Change the `-` in front of a cheat's
+name to `+` to turn it on. The file is re-read while the game runs. Included, all off by default:
 
 - Infinite HP, Infinite VT (checked against the game's memory)
 - Faster level ups / max EXP, Max status (from almarsguides.com)
@@ -139,26 +140,66 @@ The runtime is built with a performance profile (PGO) recorded while playing
 Baroque. If your compiler version can't use it, setup builds the standard
 version instead, which is a little slower.
 
-## Folder layout
+## Where your files live
+
+Since v0.1.2, your saves, settings and the build cache are kept **outside the
+app folder**, in a per-user data folder:
 
 ```
-Baroque.exe            launcher (run this)
-settings.ini           runtime settings (created on first launch)
-game\                  game.toml, cheats.txt, backup.bin (saves), runtime.log
-bios\saturn.bin        a copy of your BIOS
-runtime\               the built runtime
-tools\, build\         build tools and SaturnRecomp source (can be deleted after
-                       setup; they are downloaded again if a rebuild is needed)
-kit\                   setup script, patches, profile, templates, setup.log
+%LOCALAPPDATA%\Baroque-SaturnRecomp
 ```
+
+Paste that into File Explorer's address bar to open it. A launcher update
+(Quiver replaces the whole app folder) therefore no longer touches your saves,
+and the runtime doesn't have to be rebuilt from a fresh 1 GB download.
+
+```
+App folder (replaced by updates)
+  Baroque.exe          launcher (run this)
+  kit\                 setup script, patches, profile, templates
+  portable.txt         optional, see below
+
+Data folder (%LOCALAPPDATA%\Baroque-SaturnRecomp)
+  game\backup.bin      your saves
+  game\cheats.txt      Action Replay codes
+  game\game.toml       which disc to play (written by setup)
+  game\console.bin     Saturn clock/language settings
+  game\runtime.log     log of the last game session
+  settings.ini         runtime settings (F1 menu)
+  bios\saturn.bin      a copy of your BIOS
+  runtime\             the built runtime
+  tools\, build\       build tools and SaturnRecomp source, about 1 GB (can be
+                       deleted; they are downloaded again if a rebuild is needed)
+  setup.log            log of the last setup
+  launcher.log         what the launcher moved, and errors
+  power-restore.txt    only while a power-mode restore is pending
+```
+
+**Backing up:** copy `game\backup.bin` from the data folder. To restore, quit
+the game and put it back in the same place.
+
+**Updating from v0.1.1 or older:** the first launch of v0.1.2 moves your files
+from the app folder to the data folder: saves, cheats, settings, BIOS copy and
+the build tools. Anything already in the data folder is never overwritten; the
+old copy is then left where it was and `launcher.log` says so. If an update
+already replaced the app folder and you saved `backup.bin` by hand, put it in
+the data folder's `game\` folder (create it if needed), or in the new app
+folder's `game\` folder before the first launch.
+
+**Portable mode:** create an empty file named `portable.txt` next to
+`Baroque.exe` to keep everything in the app folder instead, as v0.1.1 did.
+Updates that replace the app folder then delete your saves, so back them up.
+
+The disc image is never copied. Keep it outside the app folder too, or setup
+will ask for it again after an update.
 
 ## Troubleshooting
 
-- **Setup failed:** `kit\setup.log` has the details. Run `Baroque.exe` again to
-  retry; finished steps are skipped.
+- **Setup failed:** `setup.log` in the data folder has the details. Run
+  `Baroque.exe` again to retry; finished steps are skipped.
 - **"Not Baroque (T-33901G)":** choose the `.cue` of the Japanese disc, and keep
   every `.bin` it lists next to it.
-- **The game stopped with an error:** see `game\runtime.log`.
+- **The game stopped with an error:** see `game\runtime.log` in the data folder.
 - **Slowdown:** close other heavy programs. On a laptop, plug in for the best results.
 
 ## Legal

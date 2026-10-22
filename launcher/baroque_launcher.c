@@ -1,11 +1,22 @@
 /* Baroque.exe -- launcher for the Baroque (SaturnRecomp) kit.
  *
+ * Player data (saves, settings, the BIOS copy) and the build cache live in
+ * %LOCALAPPDATA%\Baroque-SaturnRecomp, outside the app folder, so a launcher
+ * update that replaces the app folder cannot wipe them. A file named
+ * portable.txt beside Baroque.exe keeps everything in the app folder instead.
+ *
+ * 0. Moves what v0.1.1 and older kept in the app folder to the data folder,
+ *    never replacing anything already there.
  * 1. Runs kit\setup.ps1 when the runtime has not been built for this kit
  *    version yet, or the BIOS/disc are not set up (it asks for them).
  * 2. Starts runtime\saturnwin.exe on game\game.toml with this kit's settings,
  *    on the fastest CPU cores, at high priority, with the window focused.
  * 3. While the game runs, switches Windows' power mode to "Best performance"
  *    for the power source in use, and puts the original back afterwards.
+ *
+ * With SATURN_VK_HIDDEN set (automated tests) the game window stays hidden,
+ * setup runs without a console, errors go only to launcher.log, and the power
+ * mode is left alone.
  *
  * Usage: Baroque.exe            play (sets up first if needed)
  *        Baroque.exe --setup    re-run setup (choose another disc/BIOS)
@@ -29,11 +40,58 @@
 #endif
 #define PATHMAX 32768
 
-static wchar_t root[PATHMAX];
+static wchar_t root[PATHMAX];   /* app folder: Baroque.exe, kit\ */
+static wchar_t data[PATHMAX];   /* data folder: game\, bios\, settings.ini, runtime\, tools\, build\ */
+static int quiet;
 
-static void path(wchar_t *out, const wchar_t *rel) { swprintf(out, PATHMAX, L"%ls\\%ls", root, rel); }
-static int exists(const wchar_t *rel) { wchar_t p[PATHMAX]; path(p, rel); return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES; }
-static void fail(const wchar_t *msg) { MessageBoxW(NULL, msg, L"Baroque", MB_ICONERROR); }
+static void path(wchar_t *out, const wchar_t *rel) { swprintf(out, PATHMAX, L"%ls\\%ls", data, rel); }
+static int is_file(const wchar_t *p) { return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES; }
+static int exists(const wchar_t *rel) { wchar_t p[PATHMAX]; path(p, rel); return is_file(p); }
+
+static void note(const wchar_t *msg) {   /* appends to launcher.log in the data folder */
+    wchar_t p[PATHMAX]; path(p, L"launcher.log");
+    FILE *f = _wfopen(p, L"a, ccs=UTF-8"); if (!f) return;
+    SYSTEMTIME t; GetLocalTime(&t);
+    fwprintf(f, L"%04u-%02u-%02u %02u:%02u:%02u %ls\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, msg);
+    fclose(f);
+}
+static void fail(const wchar_t *msg) { note(msg); if (!quiet) MessageBoxW(NULL, msg, L"Baroque", MB_ICONERROR); }
+
+/* ---------------------------------------------------------- data folder */
+static void find_data(void) {
+    wchar_t p[PATHMAX], local[PATHMAX];
+    swprintf(p, PATHMAX, L"%ls\\portable.txt", root);
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", local, PATHMAX);
+    if (is_file(p) || !n || n >= PATHMAX) { wcscpy(data, root); return; }
+    swprintf(data, PATHMAX, L"%ls\\Baroque-SaturnRecomp", local);
+    if (!CreateDirectoryW(data, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) wcscpy(data, root);
+}
+
+/* v0.1.1 and older kept everything in the app folder. Move it over; anything
+ * already in the data folder wins and the old copy is left where it is. The
+ * build cache only moves within one drive (it is downloaded again otherwise). */
+static void migrate(void) {
+    static const wchar_t *items[] = {
+        L"game\\backup.bin", L"game\\cheats.txt", L"game\\console.bin", L"game\\game.toml",
+        L"settings.ini", L"bios\\saturn.bin", L"power-restore.txt", L"tools", L"build", L"runtime" };
+    static wchar_t from[PATHMAX], to[PATHMAX], parent[PATHMAX], msg[2 * PATHMAX + 128];
+    if (!_wcsicmp(root, data)) return;
+    for (size_t i = 0; i < sizeof items / sizeof *items; i++) {
+        swprintf(from, PATHMAX, L"%ls\\%ls", root, items[i]); path(to, items[i]);
+        DWORD a = GetFileAttributesW(from);
+        if (a == INVALID_FILE_ATTRIBUTES) continue;
+        if (is_file(to)) {
+            swprintf(msg, sizeof msg / sizeof *msg, L"migrate: kept %ls (%ls already exists)", from, to);
+            note(msg); continue;
+        }
+        wcscpy(parent, to); *wcsrchr(parent, L'\\') = 0;
+        CreateDirectoryW(parent, NULL);
+        BOOL ok = MoveFileExW(from, to, (a & FILE_ATTRIBUTE_DIRECTORY) ? 0 : MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH);
+        swprintf(msg, sizeof msg / sizeof *msg, ok ? L"migrate: moved %ls to %ls" : L"migrate: could not move %ls to %ls (error %lu)",
+                 from, to, GetLastError());
+        note(msg);
+    }
+}
 
 static int runtime_current(void) {
     wchar_t p[PATHMAX], v[64] = L"";
@@ -46,19 +104,21 @@ static int runtime_current(void) {
 }
 
 static int run_setup(const wchar_t *extra) {
-    wchar_t cmd[PATHMAX];
+    static wchar_t cmd[3 * PATHMAX];
     STARTUPINFOW si = {0}; PROCESS_INFORMATION pi = {0}; si.cb = sizeof si;
-    swprintf(cmd, PATHMAX,
-        L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%ls\\kit\\setup.ps1\" -Root \"%ls\" %ls",
-        root, root, extra);
-    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, root, &si, &pi)) {
+    swprintf(cmd, sizeof cmd / sizeof *cmd,
+        L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%ls\\kit\\setup.ps1\" -Root \"%ls\" -Data \"%ls\" %ls",
+        root, root, data, extra);
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, quiet ? CREATE_NO_WINDOW : CREATE_NEW_CONSOLE, NULL, root, &si, &pi)) {
         fail(L"Could not start the setup (PowerShell is required)."); return 0;
     }
     CloseHandle(pi.hThread);
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code); CloseHandle(pi.hProcess);
-    if (code) fail(L"Setup did not finish. kit\\setup.log in the game folder has the details; "
-                   L"run Baroque again to retry.");
+    if (code) {
+        swprintf(cmd, PATHMAX, L"Setup did not finish. The details are in\n%ls\\setup.log\n\nRun Baroque again to retry.", data);
+        fail(cmd);
+    }
     return code == 0;
 }
 
@@ -158,7 +218,8 @@ static int play(void) {
     if (env) {
         for (wchar_t *e = env; *e; e += wcslen(e) + 1) {
             const wchar_t *eq = wcschr(e, L'=');
-            if (eq && eq > e && !wcsncmp(e, L"SATURN_", 7) && eq - e < 256) {
+            if (eq && eq > e && !wcsncmp(e, L"SATURN_", 7) && eq - e < 256 &&
+                !(quiet && !wcsncmp(e, L"SATURN_VK_HIDDEN=", 17))) {
                 wchar_t name[256]; wcsncpy(name, e, eq - e); name[eq - e] = 0;
                 SetEnvironmentVariableW(name, NULL);
             }
@@ -182,10 +243,10 @@ static int play(void) {
     if (!ok) { fail(L"The game could not start. Run Baroque.exe --rebuild to rebuild it."); return 1; }
 
     place_on_fast_cores(pi.hProcess);
-    boost_power();
+    if (!quiet) boost_power();
     AllowSetForegroundWindow(pi.dwProcessId);   /* let the game window take keyboard focus */
     ResumeThread(pi.hThread); CloseHandle(pi.hThread);
-    while (WaitForSingleObject(pi.hProcess, 2000) == WAIT_TIMEOUT) boost_power();   /* follows plug/unplug */
+    while (WaitForSingleObject(pi.hProcess, 2000) == WAIT_TIMEOUT) if (!quiet) boost_power();   /* follows plug/unplug */
 
     DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code); CloseHandle(pi.hProcess);
     if (!restore_power()) {
@@ -198,7 +259,10 @@ static int play(void) {
             }
         }
     }
-    if (code) fail(L"The game stopped with an error. game\\runtime.log in the game folder has the details.");
+    if (code) {
+        swprintf(cmd, PATHMAX, L"The game stopped with an error. The details are in\n%ls", log);
+        fail(cmd);
+    }
     return (int)code;
 }
 
@@ -206,11 +270,14 @@ int WINAPI wWinMain(HINSTANCE a, HINSTANCE b, PWSTR args, int show) {
     (void)a; (void)b; (void)show;
     if (!GetModuleFileNameW(NULL, root, PATHMAX)) return 1;
     wchar_t *slash = wcsrchr(root, L'\\'); if (!slash) return 1; *slash = 0;
+    find_data();
+    quiet = GetEnvironmentVariableW(L"SATURN_VK_HIDDEN", NULL, 0) > 1;
 
     if (wcsstr(args, L"--restore-power")) {   /* detached: wait up to a week for the other power source */
         for (int i = 0; i < 7 * 24 * 720 && !restore_power(); i++) Sleep(5000);
         return 0;
     }
+    migrate();
     restore_power();   /* repair anything a killed launcher left behind */
 
     if (wcsstr(args, L"--rebuild")) { if (!run_setup(L"-Rebuild")) return 1; }
