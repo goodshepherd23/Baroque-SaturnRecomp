@@ -1,7 +1,16 @@
 diff --git a/runner/include/runtime_settings.h b/runner/include/runtime_settings.h
-index 96934fe..19de6f5 100644
+index 96934fe..948a01f 100644
 --- a/runner/include/runtime_settings.h
 +++ b/runner/include/runtime_settings.h
+@@ -7,7 +7,7 @@ enum { SATURN_MIN_WINDOW_WIDTH = 640, SATURN_MIN_WINDOW_HEIGHT = 480 };
+ typedef struct saturn_runtime_settings {
+     int window_width,window_height;
+     int fullscreen;
+-    int internal_scale;       /* 1..4 times native rendering resolution */
++    int internal_scale;       /* 1..8 times native rendering resolution */
+     int texture_filter;       /* 0 nearest, 1 bilinear */
+     int antialiasing;         /* 0 off, 1 FXAA */
+     int model_smoothing;      /* 0 native, 1 supersampled model edges */
 @@ -15,6 +15,7 @@ typedef struct saturn_runtime_settings {
      int target_hz;            /* preferred 60..240 Hz, retained when disabled */
      int volume;               /* 0..100, applied only to host playback */
@@ -26,6 +35,18 @@ index c285781..6891687 100644
  void smpc_padseq_load_env(saturn *s);
  
  void     bus_w8 (saturn *s, uint32_t a, uint8_t  v);
+diff --git a/runner/include/vulkan_renderer.h b/runner/include/vulkan_renderer.h
+index 6b71ad5..5d33d14 100644
+--- a/runner/include/vulkan_renderer.h
++++ b/runner/include/vulkan_renderer.h
+@@ -67,6 +67,7 @@ int  saturn_vk_present(saturn_vk_renderer *r, char *error, size_t error_size);
+ int saturn_vk_readback(saturn_vk_renderer *r, uint32_t *pixels, int width, int height,
+                        char *error, size_t error_size);
+ /* Enhanced game image before the F1 panel, at the configured internal size. */
++void saturn_vk_presented_size(const saturn_vk_renderer *r,int *width,int *height);
+ int saturn_vk_readback_presented(saturn_vk_renderer *r,uint32_t *pixels,int width,int height,
+                                char *error,size_t error_size);
+ int saturn_vk_replay_geometry(saturn_vk_renderer *r, saturn *s,
 diff --git a/runner/src/boot.c b/runner/src/boot.c
 index 29ad3b7..2dc4859 100644
 --- a/runner/src/boot.c
@@ -92,8 +113,33 @@ index 4857e5b..39cdd9c 100644
  
      case 0x70:  /* ChangeDirectory: scan the named directory. A fresh scan
                   * puts the file cursor at the first real entry -- ids 0 and 1
+diff --git a/runner/src/game_overlay.c b/runner/src/game_overlay.c
+index f671ab3..7a0bf6c 100644
+--- a/runner/src/game_overlay.c
++++ b/runner/src/game_overlay.c
+@@ -404,16 +404,16 @@ const game_overlay_draw_data *game_overlay_build(game_overlay *o,const game_over
+                 unavailable(o,caps,GAME_OVERLAY_FULLSCREEN);
+             } else if(o->tab==1) {
+                 section(o,"Graphics","Sharper rendering, with the original game intact.");
+-                const char *scales[]={"Native (1x)","2x","3x","4x"};
+-                int scale=s->internal_scale;if(scale<1)scale=1;if(scale>4)scale=4;
+-                s->internal_scale=choice(o,"Internal resolution",scales,4,scale-1,caps&GAME_OVERLAY_INTERNAL_SCALE)+1;
++                const char *scales[]={"Native (1x)","2x","3x","4x","5x","6x","7x","8x"};
++                int scale=s->internal_scale;if(scale<1)scale=1;if(scale>8)scale=8;
++                s->internal_scale=choice(o,"Internal resolution",scales,8,scale-1,caps&GAME_OVERLAY_INTERNAL_SCALE)+1;
+                 snprintf(text,sizeof text,"Render size  %d x %d  |  Higher scales use more GPU time.",v->native_width*s->internal_scale,v->native_height*s->internal_scale);caption(o,text);
+                 const char *filters[]={"Nearest / original pixels","Bilinear / smooth textures"};
+                 s->texture_filter=choice(o,"Texture filtering",filters,2,s->texture_filter!=0,caps&GAME_OVERLAY_TEXTURE_FILTER);
+                 const char *aa[]={"Off","FXAA"};
+                 s->antialiasing=choice(o,"Anti-aliasing",aa,2,s->antialiasing!=0,caps&GAME_OVERLAY_ANTIALIASING);
+                 s->model_smoothing=toggle(o,"Smooth model edges",s->model_smoothing,caps&GAME_OVERLAY_MODEL_SMOOTHING);
+-                caption(o,"Supersampled polygon edges. Original models and textures are preserved.");
++                caption(o,s->internal_scale>4?"Applies up to 4x; higher resolutions already smooth the edges.":"Supersampled polygon edges. Original models and textures are preserved.");
+             } else if(o->tab==2) {
+                 section(o,"Frame interpolation","Smoother motion between the game's original frames.");
+                 s->interpolation=toggle(o,"Frame interpolation",s->interpolation,caps&GAME_OVERLAY_INTERPOLATION);
 diff --git a/runner/src/runtime_settings.c b/runner/src/runtime_settings.c
-index 5511bf4..d4f9a37 100644
+index 5511bf4..8227d53 100644
 --- a/runner/src/runtime_settings.c
 +++ b/runner/src/runtime_settings.c
 @@ -19,7 +19,8 @@ static const setting_key keys[]={
@@ -106,7 +152,7 @@ index 5511bf4..d4f9a37 100644
  };
  enum {KEY_COUNT=sizeof keys/sizeof *keys,INTERPOLATION_KEY=7,TARGET_KEY=8};
  static const char *sections[]={"Video","Audio"};
-@@ -27,7 +28,7 @@ static const char *sections[]={"Video","Audio"};
+@@ -27,15 +28,15 @@ static const char *sections[]={"Video","Audio"};
  static int clamp(int n,int low,int high) {return n<low?low:n>high?high:n;}
  void saturn_settings_defaults(saturn_runtime_settings *s) {
      if(!s)return;
@@ -115,9 +161,10 @@ index 5511bf4..d4f9a37 100644
  }
  void saturn_settings_normalize(saturn_runtime_settings *s) {
      if(!s)return;
-@@ -35,7 +36,7 @@ void saturn_settings_normalize(saturn_runtime_settings *s) {
+     s->window_width=clamp(s->window_width,SATURN_MIN_WINDOW_WIDTH,7680);
      s->window_height=clamp(s->window_height,SATURN_MIN_WINDOW_HEIGHT,4320);
-     s->internal_scale=clamp(s->internal_scale,1,4);
+-    s->internal_scale=clamp(s->internal_scale,1,4);
++    s->internal_scale=clamp(s->internal_scale,1,8);
      s->target_hz=clamp(s->target_hz,60,240);s->volume=clamp(s->volume,0,100);
 -    s->fullscreen=!!s->fullscreen;s->interpolation=!!s->interpolation;s->muted=!!s->muted;
 +    s->fullscreen=!!s->fullscreen;s->interpolation=!!s->interpolation;s->muted=!!s->muted;s->widescreen=!!s->widescreen;
@@ -368,10 +415,37 @@ index 390ccb5..5a8dbeb 100644
  void smpc_reset(saturn *s)
  {
      memset(s->smpc_reg, 0, sizeof(s->smpc_reg));
+diff --git a/runner/src/vulkan_quality.h b/runner/src/vulkan_quality.h
+index d02ce8d..45ebee0 100644
+--- a/runner/src/vulkan_quality.h
++++ b/runner/src/vulkan_quality.h
+@@ -123,8 +123,11 @@ fail:
+ 
+ int saturn_vk_set_quality(saturn_vk_renderer *r,const saturn_runtime_settings *settings,char *error,size_t size) {
+     if(!r||!settings)return 0;
+-    unsigned scale=(unsigned)settings->internal_scale*(settings->model_smoothing?2u:1u);
+-    if(settings->internal_scale<1||settings->internal_scale>4||scale>8u){set_error(error,size,"Invalid internal resolution");return 0;}
++    /* Model smoothing doubles the geometry scale only while that stays within
++       the 8x the VDP1/VDP2 shaders and buffers support; above 4x the base
++       resolution already supersamples the edges. */
++    unsigned scale=(unsigned)settings->internal_scale*(settings->model_smoothing&&settings->internal_scale<=4?2u:1u);
++    if(settings->internal_scale<1||settings->internal_scale>8||scale>8u){set_error(error,size,"Invalid internal resolution");return 0;}
+     int active=settings->internal_scale>1||settings->texture_filter||settings->antialiasing||settings->model_smoothing;
+     if(active) {
+         if(!quality_resources(r,scale,error,size))return 0;
 diff --git a/runner/src/vulkan_renderer.c b/runner/src/vulkan_renderer.c
-index 601610e..45f8937 100644
+index 601610e..5b28a42 100644
 --- a/runner/src/vulkan_renderer.c
 +++ b/runner/src/vulkan_renderer.c
+@@ -153,7 +153,7 @@ static int quality_active(const saturn_vk_renderer *r) {
+ }
+ static unsigned quality_scale(const saturn_vk_renderer *r) {
+     unsigned scale=r->quality.internal_scale>0?(unsigned)r->quality.internal_scale:1u;
+-    return scale*(r->quality.model_smoothing?2u:1u);
++    return scale*(r->quality.model_smoothing&&scale<=4u?2u:1u);
+ }
+ 
+ static int op_bounds(const saturn_vk_vdp1_op *o, int *x0, int *y0, int *x1, int *y1)
 @@ -739,7 +739,9 @@ int saturn_vk_render(saturn_vk_renderer *r, saturn *s, int width, int height,
      image_barrier(r->command,output,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
      image_barrier(r->command,r->swap_images[image_index],VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,0,VK_ACCESS_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -383,8 +457,16 @@ index 601610e..45f8937 100644
      VkImageBlit bl={0};bl.srcSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;bl.srcSubresource.layerCount=1;bl.srcOffsets[1].x=width*(int)internal_scale;bl.srcOffsets[1].y=height*(int)internal_scale;bl.srcOffsets[1].z=1;bl.dstSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;bl.dstSubresource.layerCount=1;bl.dstOffsets[0].x=x0;bl.dstOffsets[0].y=y0;bl.dstOffsets[1].x=x1;bl.dstOffsets[1].y=y1;bl.dstOffsets[1].z=1;
      vkCmdBlitImage(r->command,output,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,r->swap_images[image_index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&bl,VK_FILTER_NEAREST);
      image_barrier(r->command,output,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,VK_ACCESS_TRANSFER_READ_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+@@ -987,6 +989,7 @@ int saturn_vk_readback(saturn_vk_renderer *r,uint32_t *pixels,int width,int heig
+     if(!r||width>704||height>512)return 0;
+     return readback_image(r,r->output,pixels,width,height,error,size);
+ }
++void saturn_vk_presented_size(const saturn_vk_renderer *r,int *width,int *height){*width=r?r->presented_width:0;*height=r?r->presented_height:0;}
+ int saturn_vk_readback_presented(saturn_vk_renderer *r,uint32_t *pixels,int width,int height,char *error,size_t size) {
+     if(!r||width!=r->presented_width||height!=r->presented_height){set_error(error,size,"Presented image dimensions do not match");return 0;}
+     return readback_image(r,r->presented_output,pixels,width,height,error,size);
 diff --git a/runner/src/window.c b/runner/src/window.c
-index e923992..981e5f0 100644
+index e923992..a103782 100644
 --- a/runner/src/window.c
 +++ b/runner/src/window.c
 @@ -586,8 +586,16 @@ int main(int argc, char **argv)
@@ -460,7 +542,37 @@ index e923992..981e5f0 100644
                  }
                  if (!g_debug) { dst.x = (ww - dst.w) / 2; dst.y = (wh - dst.h) / 2; }
                  SDL_RenderCopy(ren, show, NULL, &dst);
-@@ -1327,6 +1362,8 @@ int main(int argc, char **argv)
+@@ -1204,6 +1239,29 @@ int main(int argc, char **argv)
+                     fprintf(stderr, "[video] enhanced frame failed: %s\n", vk_error);
+                     running = 0;
+                 }
++                /* SATURN_VK_CAPTURE_ENHANCED=<prefix> saves the replayed
++                 * (upscaled) picture every SATURN_VK_CAPTURE_EVERY fields. */
++                {
++                    static uint64_t enhanced_last;
++                    const char *prefix = getenv("SATURN_VK_CAPTURE_ENHANCED");
++                    const char *every_env = getenv("SATURN_VK_CAPTURE_EVERY");
++                    uint64_t every = every_env ? strtoull(every_env, NULL, 0) : 0;
++                    if (prefix && every && presentation_active && s->frames != enhanced_last &&
++                        s->frames % every == 0) {
++                        int pw = 0, ph = 0;
++                        enhanced_last = s->frames;
++                        saturn_vk_presented_size(vk, &pw, &ph);
++                        uint32_t *big = pw > 0 && ph > 0 ? (uint32_t *)malloc((size_t)pw * (size_t)ph * sizeof *big) : NULL;
++                        char shot[1024];
++                        snprintf(shot, sizeof shot, "%s-%06llu.png", prefix, (unsigned long long)s->frames);
++                        if (big && saturn_vk_readback_presented(vk, big, pw, ph, vk_error, sizeof vk_error) &&
++                            png_write(shot, big, pw, ph) == 0)
++                            fprintf(stderr, "[video] captured enhanced field %llu (%dx%d) to %s\n",
++                                    (unsigned long long)s->frames, pw, ph, shot);
++                        else fprintf(stderr, "[video] enhanced capture failed: %s\n", vk_error);
++                        free(big);
++                    }
++                }
+                 if (!saturn_vk_present(vk, vk_error, sizeof vk_error)) {
+                     fprintf(stderr, "[video] Vulkan present failed: %s\n", vk_error);
+                     running = 0;
+@@ -1327,6 +1385,8 @@ int main(int argc, char **argv)
      fprintf(stderr, "[runtime] fields %llu cycles %llu\n",
              (unsigned long long)s->frames, (unsigned long long)s->master.cycles);
      saturn_report_trace(s, stdout);
@@ -469,3 +581,16 @@ index e923992..981e5f0 100644
  
      if (audio_dev) SDL_CloseAudioDevice(audio_dev);
      diagnostics_close(&diagnostics);
+diff --git a/tests/runtime_settings.c b/tests/runtime_settings.c
+index 08b9066..cf3d3b7 100644
+--- a/tests/runtime_settings.c
++++ b/tests/runtime_settings.c
+@@ -45,7 +45,7 @@ int main(void) {
+     fixture(path,"\xef\xbb\xbf[video]\nTargetHz=239\nInterpolation=120\nWindowWidth=100000\nWindowHeight=-1\nInternalScale=50\nFullscreen=-3\nTextureFilter=-1\nAntialiasing=2\nModelSmoothing=9\n[AuDio]\nVolume=200\nMuted=3\n");
+     CHECK(saturn_settings_load(&s,path));
+     CHECK(s.target_hz==239&&s.interpolation&&s.window_width==7680&&s.window_height==480);
+-    CHECK(s.internal_scale==4&&s.fullscreen==1&&s.texture_filter==0&&s.antialiasing==1&&s.model_smoothing==1);
++    CHECK(s.internal_scale==8&&s.fullscreen==1&&s.texture_filter==0&&s.antialiasing==1&&s.model_smoothing==1);
+     CHECK(s.volume==100&&s.muted==1);
+     CHECK(saturn_settings_save(&s,path)&&saturn_settings_load(&t,path)&&!memcmp(&s,&t,sizeof s));
+ 
