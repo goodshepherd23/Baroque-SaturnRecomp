@@ -24,7 +24,7 @@ $Root = (Resolve-Path -LiteralPath $Root).Path
 if (-not $Data) { $Data = $Root }
 New-Item -ItemType Directory -Force -Path $Data | Out-Null
 $Data = (Resolve-Path -LiteralPath $Data).Path
-$KitVersion   = (Get-Content -LiteralPath "$Root\kit\kit-version.txt" -Raw).Trim()   # not version.txt: Quiver owns that file
+$KitVersion   = (Get-Content -LiteralPath "$Root\kit\runtime-version.txt" -Raw).Trim()   # bumped only when the patched runtime changes
 $SaturnCommit = '26c9715e5493054b8a205aa31d73d8f125fdd8f5'
 $SaturnZip    = "https://codeload.github.com/sonsegajp/SaturnRecomp/zip/$SaturnCommit"
 $MsysUrl      = 'https://github.com/msys2/msys2-installer/releases/download/2026-09-27/msys2-base-x86_64-20260927.sfx.exe'

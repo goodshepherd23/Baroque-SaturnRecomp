@@ -7,10 +7,11 @@
  *
  * 0. Moves what v0.1.1 and older kept in the app folder to the data folder,
  *    never replacing anything already there.
- * 1. Runs kit\setup.ps1 when the runtime has not been built for this kit
+ * 1. Runs kit\setup.ps1 when the runtime has not been built for this runtime
  *    version yet, or the BIOS/disc are not set up (it asks for them).
  * 2. Starts runtime\saturnwin.exe on game\game.toml with this kit's settings,
  *    on the fastest CPU cores, at high priority, with the window focused.
+ *    [Audio] AudioBuffer in settings.ini sets the sound lead (default 2048).
  * 3. While the game runs, switches Windows' power mode to "Best performance"
  *    for the power source in use, and puts the original back afterwards.
  *
@@ -28,7 +29,9 @@
 #include <string.h>
 #include <wchar.h>
 
-/* -DKIT_VER=0.1.0 (a bare token, so no shell quoting is involved) */
+/* -DKIT_VER=0.1.0 -DRUNTIME_VER=0.1.0 (bare tokens, so no shell quoting is
+ * involved). RUNTIME_VER only changes when the patched runtime does, so a
+ * launcher-only update does not trigger a rebuild. */
 #define KIT_STR_(x) #x
 #define KIT_STR(x) KIT_STR_(x)
 #define KIT_WIDE_(s) L##s
@@ -37,6 +40,11 @@
 #define KIT_VERSION KIT_WIDE(KIT_STR(KIT_VER))
 #else
 #define KIT_VERSION L"dev"
+#endif
+#ifdef RUNTIME_VER
+#define RUNTIME_VERSION KIT_WIDE(KIT_STR(RUNTIME_VER))
+#else
+#define RUNTIME_VERSION KIT_VERSION
 #endif
 #define PATHMAX 32768
 
@@ -98,7 +106,7 @@ static int runtime_current(void) {
     path(p, L"runtime\\.kit-version");
     FILE *f = _wfopen(p, L"r");
     if (!f) return 0;
-    int ok = fwscanf(f, L"%63ls", v) == 1 && !wcscmp(v, KIT_VERSION);
+    int ok = fwscanf(f, L"%63ls", v) == 1 && !wcscmp(v, RUNTIME_VERSION);
     fclose(f);
     return ok && exists(L"runtime\\saturnwin.exe");
 }
@@ -228,6 +236,14 @@ static int play(void) {
     }
     SetEnvironmentVariableW(L"SATURN_SETTINGS_FILE", settings);
     SetEnvironmentVariableW(L"SATURN_SMPCFILE", L"console.bin");
+    /* A deeper sound lead than the runtime's 1024 frames rides out the boot
+     * logo's slow fields without crackling, for ~23 ms more audio latency. */
+    {
+        wchar_t frames[16];
+        UINT n = GetPrivateProfileIntW(L"Audio", L"AudioBuffer", 2048, settings);
+        swprintf(frames, 16, L"%u", n < 256 ? 256 : n > 8192 ? 8192 : n);
+        SetEnvironmentVariableW(L"SATURN_SNDBUF", frames);
+    }
 
     SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
     HANDLE out = CreateFileW(log, GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);

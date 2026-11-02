@@ -4,13 +4,14 @@ param([string]$Gcc = 'C:\msys64\mingw64\bin\gcc.exe')
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $version = (Get-Content -LiteralPath "$repo\kit\kit-version.txt" -Raw).Trim()
+$runtimeVersion = (Get-Content -LiteralPath "$repo\kit\runtime-version.txt" -Raw).Trim()
 $stage = "$repo\dist\stage"
 $zip = "$repo\dist\Baroque-SaturnRecomp-v$version-windows-x64.zip"
 
 if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 $env:PATH = (Split-Path -Parent $Gcc) + ';' + $env:PATH
-& $Gcc -O2 -std=c11 -Wall -Wextra -municode -mwindows -static "-DKIT_VER=$version" `
+& $Gcc -O2 -std=c11 -Wall -Wextra -municode -mwindows -static "-DKIT_VER=$version" "-DRUNTIME_VER=$runtimeVersion" `
     "$repo\launcher\baroque_launcher.c" -ladvapi32 -o "$stage\Baroque.exe"
 if ($LASTEXITCODE -ne 0) { throw 'launcher build failed' }
 

@@ -93,6 +93,14 @@ Baroque has a built-in anamorphic widescreen mode for 16:9 TVs. To use it:
 The dungeon then shows a wider view at correct proportions. Menus and movies
 look stretched in this mode, exactly as they did on a widescreen TV.
 
+## Audio buffer
+
+`Baroque.exe` keeps 2048 frames (about 46 ms) of sound queued, twice
+SaturnRecomp's default. In testing, that cut audio dropouts during the Sega
+Saturn boot logo from 12 to 1. To change it, set `AudioBuffer=` under `[Audio]`
+in `settings.ini`. Lower values (down to 256) reduce latency, and higher values
+(up to 8192) help a slower PC.
+
 ## Cheats
 
 Edit `game\cheats.txt` in the data folder. Change the `-` in front of a cheat's
