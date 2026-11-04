@@ -19,7 +19,7 @@ launcher, and settings that make it pleasant to play on a laptop.
 - Boots through the real Saturn BIOS into the opening movie, title, menus and
   full gameplay in the dungeon. Tested by the author through the opening area,
   not a full playthrough.
-- **Full speed (60 fps)** on a 15 W Intel i7-1355U laptop when plugged in. Battery
+- **Full speed (60 fps)** on a 15 W Intel i7-1355U laptop when plugged in, at internal resolutions up to 3x. Battery
   play benefits from the power-mode switch below, but hasn't been measured in
   gameplay.
 - **Saves**: Saturn internal backup RAM is kept in `game\backup.bin` in your
@@ -77,11 +77,18 @@ runtime, run `Baroque.exe --rebuild`.
 Saturn's resolution. Plain SaturnRecomp stops at 4x. **6x** draws Baroque at
 2112 x 1344, about 1440p, with much sharper walls and polygon edges. The 2D
 HUD keeps its original artwork. You can also set `InternalScale=6` in
-`settings.ini`.
+`settings.ini`. **Texture filtering** and **FXAA** in the same menu only take
+effect above 1x.
 
-Higher scales cost GPU time. On integrated graphics, which share power with
-the CPU, 6x needed the launcher's Best performance switch to stay at full
-speed in testing. Drop to 4x if you see slowdown.
+Before v0.1.4, these settings did nothing in the dungeon itself, only in the
+BIOS logo and menus. The dungeon was always drawn at the native 352 x 224.
+v0.1.4 fixes that, so higher scales now really cost GPU time during play.
+
+How high to go depends on your graphics. On a 15 W laptop with Intel Iris Xe
+graphics, **3x** (1056 x 672) stayed at full speed in the dungeon, with 0.7%
+of frames late, the same as 1x. 4x had 15% late frames and 5x had 29%. A
+dedicated graphics card should manage 6x or more. If the dungeon stutters,
+lower the scale.
 
 ## Widescreen
 
@@ -141,6 +148,9 @@ are in `kit\patches` and were offered back to the author in
 - **Keyboard focus** when the game is started from a launcher.
 - **A `Widescreen` setting** for 16:9 presentation.
 - **Internal resolution up to 8x** (was 4x).
+- **Upscaling in the dungeon.** Baroque clears the screen there with a full-screen
+  polygon instead of the VDP1 erase, so upscaling, texture filtering and FXAA
+  fell back to the native picture. A full-screen opaque polygon now counts as a clear.
 - **Action Replay code support** (`cheats.txt`).
 - Two small diagnostics improvements.
 
@@ -208,7 +218,7 @@ will ask for it again after an update.
 - **"Not Baroque (T-33901G)":** choose the `.cue` of the Japanese disc, and keep
   every `.bin` it lists next to it.
 - **The game stopped with an error:** see `game\runtime.log` in the data folder.
-- **Slowdown:** close other heavy programs. On a laptop, plug in for the best results.
+- **Slowdown:** lower the internal resolution in F1 (3x is smooth on Intel Iris Xe), close other heavy programs, and on a laptop, plug in.
 
 ## Legal
 
