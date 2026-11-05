@@ -72,19 +72,61 @@ if ($Bios) {
 }
 Write-Host "BIOS: $biosDst"
 
+
 function Test-BaroqueCue([string]$cue) {
-    $dir = Split-Path -Parent $cue
-    $files = Select-String -LiteralPath $cue -Pattern '^\s*FILE\s+"(.+)"' | ForEach-Object { $_.Matches[0].Groups[1].Value }
-    if (-not $files) { throw "No FILE lines in $cue" }
-    foreach ($f in $files) { if (-not (Test-Path -LiteralPath (Join-Path $dir $f))) { throw "The cue sheet needs '$f' next to it." } }
-    $first = Join-Path $dir $files[0]
+    $cue = (Resolve-Path -LiteralPath $cue -ErrorAction Stop).Path
+    $dir = [System.IO.Path]::GetDirectoryName($cue)
+
+    # Parse FILE entries without relying on Select-String's MatchInfo objects.
+    $files = @(
+        foreach ($line in Get-Content -LiteralPath $cue) {
+            if ($line -match '^\s*FILE\s+(?:"([^"]+)"|(\S+))\s+(?:BINARY|MOTOROLA)\s*$') {
+                if ($Matches[1]) {
+                    $Matches[1]
+                } else {
+                    $Matches[2]
+                }
+            }
+        }
+    )
+
+    if ($files.Count -eq 0) {
+        throw "No valid FILE entries found in $cue"
+    }
+
+    foreach ($f in $files) {
+        $path = Join-Path -Path $dir -ChildPath $f
+
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "The CUE references a missing file: $path"
+        }
+    }
+
+    $first = Join-Path -Path $dir -ChildPath $files[0]
+
     $raw = (Get-Content -LiteralPath $cue -Raw) -match 'MODE1/2352|MODE2/2352'
+
     $fs = [IO.File]::OpenRead($first)
-    try { $buf = New-Object byte[] 64; $fs.Position = $(if ($raw) { 16 } else { 0 }); [void]$fs.Read($buf, 0, 64) } finally { $fs.Close() }
+
+    try {
+        $buf = New-Object byte[] 64
+        $fs.Position = $(if ($raw) { 16 } else { 0 })
+        [void]$fs.Read($buf, 0, 64)
+    } finally {
+        $fs.Close()
+    }
+
     $hdr = [Text.Encoding]::ASCII.GetString($buf)
-    if (-not $hdr.StartsWith('SEGA SEGASATURN')) { throw 'This is not a Sega Saturn disc image.' }
-    if ($hdr.Substring(0x20, 8) -ne 'T-33901G') { throw "This disc is $($hdr.Substring(0x20, 10).Trim()), not Baroque (T-33901G)." }
+
+    if (-not $hdr.StartsWith('SEGA SEGASATURN')) {
+        throw 'This is not a Sega Saturn disc image.'
+    }
+
+    if ($hdr.Substring(0x20, 8) -ne 'T-33901G') {
+        throw "This disc is $($hdr.Substring(0x20, 10).Trim()), not Baroque (T-33901G)."
+    }
 }
+
 
 Step 'Your Baroque disc'
 $toml = "$game\game.toml"
