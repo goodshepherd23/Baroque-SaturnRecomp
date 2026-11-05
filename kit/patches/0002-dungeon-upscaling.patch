@@ -1,0 +1,66 @@
+Upscaling, texture filtering and FXAA in the dungeon.
+
+Baroque clears the screen in the dungeon by drawing a full-screen black
+polygon instead of using the VDP1 erase. The renderer only started a new
+replayable picture at an erase, so its per-frame list grew to the 8192 cap
+and the enhanced path fell back to the native 352x224 picture there. An
+opaque, untextured, full-screen rectangle now counts as a clear.
+
+--- a/runner/src/vulkan_renderer.c
++++ b/runner/src/vulkan_renderer.c
+@@ -460,6 +460,23 @@ static int create_compute(saturn_vk_renderer *r, const char *name, VkPipelineLay
+     return 1;
+ }
+ 
++/* An opaque, untextured, axis-aligned polygon covering at least (0,0)-(w,h)
++ * hides everything drawn before it, exactly like a VDP1 erase. Games that
++ * clear with such a polygon instead of the erase function (Baroque in the
++ * dungeon) must still start a new replayable picture there; otherwise the
++ * history grows to its cap and upscaling silently falls back to native.
++ * Mesh, MSB-on, colour calculation and user clipping can leave pixels
++ * showing through, so they never count. */
++static int vdp1_full_clear(const saturn_vk_vdp1_op *o, int w, int h)
++{
++    if (o->kind != SATURN_VK_VDP1_QUAD || o->textured || (o->pmod & 0x8507u)) return 0;
++    const int32_t *v = o->xy;
++    if (v[1] != v[3] || v[5] != v[7] || v[0] != v[6] || v[2] != v[4]) return 0;
++    int x0 = v[0] < v[2] ? v[0] : v[2], x1 = v[0] < v[2] ? v[2] : v[0];
++    int y0 = v[1] < v[5] ? v[1] : v[5], y1 = v[1] < v[5] ? v[5] : v[1];
++    return x0 <= 0 && y0 <= 0 && x1 >= w && y1 >= h;
++}
++
+ static int queue_vdp1(void *userdata, const saturn_vk_vdp1_op *op)
+ {
+     saturn_vk_renderer *r = userdata;
+@@ -481,7 +498,7 @@ static int queue_vdp1(void *userdata, const saturn_vk_vdp1_op *op)
+         unsigned b=op->target&1;
+         r->geometry_revision[b]=++r->command_revision;
+         if(!r->geometry[b])r->geometry[b]=malloc(8192*sizeof(*op));
+-        if(op->kind==SATURN_VK_VDP1_ERASE)r->geometry_count[b]=0;
++        if(op->kind==SATURN_VK_VDP1_ERASE||vdp1_full_clear(op,op->sys_x1,op->sys_y1))r->geometry_count[b]=0;
+         if(r->geometry[b] && r->geometry_count[b]<8192)
+             r->geometry[b][r->geometry_count[b]++]=*op;
+     }
+@@ -646,7 +663,8 @@ int saturn_vk_render(saturn_vk_renderer *r, saturn *s, int width, int height,
+             for(unsigned i=0;i<draw_count;i++) {
+                 unsigned bit=1u<<(draw_ops[i].target&1u);
+                 touched|=bit;
+-                if(draw_ops[i].kind==SATURN_VK_VDP1_ERASE)cleared|=bit;
++                if(draw_ops[i].kind==SATURN_VK_VDP1_ERASE||
++                   vdp1_full_clear(&draw_ops[i],draw_ops[i].sys_x1,draw_ops[i].sys_y1))cleared|=bit;
+             }
+             for(unsigned b=0;b<2;b++)if(touched&(1u<<b)) {
+                 if(!r->geometry_vram[b])r->geometry_vram[b]=malloc(VDP1_VRAM_SZ);
+@@ -851,8 +869,10 @@ int saturn_vk_interpolation_begin(saturn_vk_renderer *r,saturn *s,int w,int h,ch
+     int sprite_width=w>512?(w+1)/2:w;
+     int sprite_height=((s->vdp2_reg[0]&0xc0u)==0xc0u&&!getenv("SATURN_VK_VDP1_ONLY"))?(h+1)/2:h;
+     if(sprite_width>512)sprite_width=512;if(sprite_height>256)sprite_height=256;
+-    int safe=r->geometry_material_valid[b] && n && n<8192 && cur[0].kind==SATURN_VK_VDP1_ERASE &&
+-        cur[0].xy[0]==0 && cur[0].xy[1]==0 && cur[0].xy[2]>=sprite_width && cur[0].xy[3]>=sprite_height-1;
++    int safe=r->geometry_material_valid[b] && n && n<8192 &&
++        ((cur[0].kind==SATURN_VK_VDP1_ERASE &&
++          cur[0].xy[0]==0 && cur[0].xy[1]==0 && cur[0].xy[2]>=sprite_width && cur[0].xy[3]>=sprite_height-1) ||
++         vdp1_full_clear(&cur[0],sprite_width-1,sprite_height-1));
+     for(unsigned i=0;i<n;i++)if(cur[i].kind==SATURN_VK_VDP1_FB_WRITE)safe=0;
+     /* New source pictures are identified by the guest's draw operations,
+      * not by integer XY differences. Quantized still vertices can belong to
