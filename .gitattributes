@@ -1,0 +1,2 @@
+*.patch -text
+kit/libchdr.sha256 text eol=lf

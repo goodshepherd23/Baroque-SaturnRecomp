@@ -86,6 +86,20 @@ function Test-BaroqueCue([string]$cue) {
     if ($hdr.Substring(0x20, 8) -ne 'T-33901G') { throw "This disc is $($hdr.Substring(0x20, 10).Trim()), not Baroque (T-33901G)." }
 }
 
+function Test-ChdMagic([string]$p) {
+    $fs = [IO.File]::OpenRead($p)
+    try { $b = New-Object byte[] 8; [void]$fs.Read($b, 0, 8) } finally { $fs.Close() }
+    return [Text.Encoding]::ASCII.GetString($b) -eq 'MComprHD'
+}
+
+# A .chd is read by the runtime itself (libchdr, see kit\patches). chdcheck.exe, built with it,
+# says whether the image is Baroque; the wrong game is refused here, before anything long runs.
+function Test-ChdIsBaroque([string]$exe) {
+    $out = Native { & $exe $Disc 'T-33901G' 2>&1 | ForEach-Object { "$_" } }
+    if ($LASTEXITCODE -ne 0) { Remove-Item -LiteralPath $toml -ErrorAction SilentlyContinue; Fail ($out -join ' ') }
+    Write-Host 'The CHD is Baroque (T-33901G).'
+}
+
 Step 'Your Baroque disc'
 $toml = "$game\game.toml"
 if (-not $Disc -and (Test-Path -LiteralPath $toml)) {
@@ -93,15 +107,19 @@ if (-not $Disc -and (Test-Path -LiteralPath $toml)) {
     if ($m) { $existing = $m.Matches[0].Groups[1].Value -replace '/', '\'; if (Test-Path -LiteralPath $existing) { $Disc = $existing } }
 }
 if (-not $Disc) {
-    $local = Get-ChildItem -LiteralPath "$Root\disc", "$Data\disc" -Filter *.cue -ErrorAction SilentlyContinue | Select-Object -First 1
+    $local = Get-ChildItem -LiteralPath "$Root\disc", "$Data\disc" -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.cue', '.chd' } | Select-Object -First 1
     if ($local) { $Disc = $local.FullName }
 }
 if (-not $Disc) {
-    Write-Host 'Choose the .cue file of your Baroque (Japan) disc image. The English fan translation is supported.'
-    $Disc = Pick-File 'Choose your Baroque disc (.cue)' 'CUE sheet (*.cue)|*.cue'
+    Write-Host 'Choose your Baroque (Japan) disc image: its .cue file, or a .chd. The English fan translation is supported.'
+    $Disc = Pick-File 'Choose your Baroque disc (.cue or .chd)' 'Disc image (*.cue;*.chd)|*.cue;*.chd|CUE sheet (*.cue)|*.cue|CHD image (*.chd)|*.chd'
     if (-not $Disc) { Fail 'No disc chosen.' }
 }
-try { Test-BaroqueCue $Disc } catch { Fail $_.Exception.Message }
+$isChd = $Disc -match '\.chd$'
+try {
+    if ($isChd) { if (-not (Test-ChdMagic $Disc)) { throw 'That file is not a CHD disc image.' } }
+    else { Test-BaroqueCue $Disc }
+} catch { Fail $_.Exception.Message }
 $discToml = (Resolve-Path -LiteralPath $Disc).Path -replace '\\', '/'
 [IO.File]::WriteAllText($toml, (Get-Content -LiteralPath "$kit\game\game.toml.in" -Raw).Replace('@DISC@', $discToml),
     (New-Object Text.UTF8Encoding($false)))
@@ -115,6 +133,7 @@ if (-not (Test-Path -LiteralPath "$Data\settings.ini")) { Copy-Item -LiteralPath
 $stamp = "$runtime\.kit-version"
 if (-not $Rebuild -and (Test-Path -LiteralPath "$runtime\saturnwin.exe") -and (Test-Path -LiteralPath $stamp) -and
     (Get-Content -LiteralPath $stamp -Raw).Trim() -eq $KitVersion) {
+    if ($isChd -and (Test-Path -LiteralPath "$runtime\chdcheck.exe")) { Test-ChdIsBaroque "$runtime\chdcheck.exe" }
     Step 'The runtime is already built for this version.'
     Stop-Transcript | Out-Null; exit 0
 }
@@ -159,6 +178,54 @@ foreach ($p in Get-ChildItem -LiteralPath "$kit\patches" -Filter *.patch | Sort-
     if ($LASTEXITCODE -ne 0) { Fail "Patch $($p.Name) did not apply." }
 }
 
+# ---------------------------------------------------------------- libchdr (.chd images)
+# kit\libchdr.sha256 pins libchdr's commit and the SHA-256 of every file the build uses.
+Step 'libchdr (for .chd disc images)'
+$chdrList = Get-Content -LiteralPath "$kit\libchdr.sha256"
+$chdrCommit = [regex]::Match($chdrList[0], '@ ([0-9a-f]{40})').Groups[1].Value
+$chdrFiles = @($chdrList | Where-Object { $_ -match '^[0-9a-f]{64}  ' } | ForEach-Object { , @($_.Substring(0, 64), $_.Substring(66)) })
+if (-not $chdrCommit -or -not $chdrFiles.Count) { Fail 'kit\libchdr.sha256 is not in the expected format.' }
+$chdr = "$tools\libchdr"
+function Test-Libchdr {
+    foreach ($e in $chdrFiles) {
+        $f = Join-Path $chdr $e[1]
+        if (-not (Test-Path -LiteralPath $f) -or (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLowerInvariant() -ne $e[0]) { return $false }
+    }
+    return $true
+}
+if (-not (Test-Libchdr)) {
+    Write-Host "Downloading libchdr $($chdrCommit.Substring(0, 7))..."
+    $dl = "$build\libchdr-download"
+    if (Test-Path -LiteralPath $dl) { Remove-Item -LiteralPath $dl -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $dl | Out-Null
+    Invoke-WebRequest "https://codeload.github.com/rtissera/libchdr/zip/$chdrCommit" -OutFile "$dl\libchdr.zip" -UseBasicParsing
+    Expand-Archive -LiteralPath "$dl\libchdr.zip" -DestinationPath "$dl\x"
+    $top = (Get-ChildItem "$dl\x" -Directory | Select-Object -First 1).FullName
+    if (Test-Path -LiteralPath $chdr) { Remove-Item -LiteralPath $chdr -Recurse -Force }
+    foreach ($e in $chdrFiles) {
+        $from = Join-Path $top $e[1]
+        if (-not (Test-Path -LiteralPath $from) -or (Get-FileHash -LiteralPath $from -Algorithm SHA256).Hash.ToLowerInvariant() -ne $e[0]) {
+            Remove-Item -LiteralPath $dl -Recurse -Force
+            Fail "libchdr failed its checksum: $($e[1])"
+        }
+        $to = Join-Path $chdr $e[1]
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $to) | Out-Null
+        Copy-Item -LiteralPath $from -Destination $to
+    }
+    Remove-Item -LiteralPath $dl -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path "$src\external" | Out-Null
+Copy-Item -LiteralPath $chdr -Destination "$src\external\libchdr" -Recurse -Force
+
+# The CHD checker: libchdr plus the runtime's CHD reader, a few seconds to build.
+$env:PATH = "$mingw;$env:PATH"   # gcc needs the DLLs next to it
+$chk = "$build\chdcheck.exe"
+$lc = "$src\external\libchdr"
+$chkSrc = @(Get-ChildItem "$lc\src" -Filter 'libchdr_*.c' | ForEach-Object FullName) + "$lc\deps\lzma-26.02\src\LzmaDec.c" + "$src\recompiler\src\disc_chd.c" + "$src\tools\chdcheck.c"
+Native { & "$mingw\gcc.exe" -O1 -DCHDR_SYSTEM_ZLIB -DCHDR_SYSTEM_ZSTD "-I$src\recompiler\include" "-I$lc\include" "-I$lc\deps\lzma-26.02\include" @chkSrc '-Wl,-Bstatic' -lzstd -lz '-Wl,-Bdynamic' -o $chk 2>&1 | Out-Null }
+if (-not (Test-Path -LiteralPath $chk)) { Fail 'The CHD checker did not build.' }
+if ($isChd) { Test-ChdIsBaroque $chk }
+
 # ---------------------------------------------------------------- build
 Step 'Building the runtime (a few minutes)'
 $env:PATH = "$mingw;$env:PATH"
@@ -190,6 +257,7 @@ Step 'Installing'
 New-Item -ItemType Directory -Force -Path "$runtime\shaders" | Out-Null
 Copy-Item -LiteralPath "$src\out\runtime-build\saturnwin.exe" -Destination $runtime -Force
 Copy-Item -LiteralPath "$mingw\SDL2.dll" -Destination $runtime -Force
+Copy-Item -LiteralPath $chk -Destination $runtime -Force
 Copy-Item -Path "$src\runner\shaders\*.spv" -Destination "$runtime\shaders" -Force
 Set-Content -LiteralPath $stamp -Value $KitVersion
 Write-Host ''

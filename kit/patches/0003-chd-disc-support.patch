@@ -1,0 +1,527 @@
+diff --git a/recompiler/include/disc.h b/recompiler/include/disc.h
+index 57899c9..6ba7460 100644
+--- a/recompiler/include/disc.h
++++ b/recompiler/include/disc.h
+@@ -3,6 +3,7 @@
+  * Handles the image formats Saturn rips actually come in:
+  *   - .cue + .bin, single or multiple BIN files
+  *   - bare .bin / .iso (2352 or 2048 byte sectors, auto-detected)
++ *   - .chd (MAME compressed CD image; needs a build with DISC_WITH_CHD)
+  *
+  * Sector geometry is *detected*, not assumed. Real rips disagree with their
+  * own cue sheets: pregaps may or may not be present in the BIN, and a single
+@@ -39,6 +40,7 @@ typedef struct {
+     char        path[1024];
+     uint64_t    size;          /* raw bytes, or decoded/padded PCM bytes */
+     void       *audio_decoder; /* seekable decoder for compressed CDDA   */
++    void       *chd;           /* chd_image* when this "file" is a .chd  */
+     uint64_t    pcm_frames;    /* decoded stereo sample frames           */
+     uint64_t    pcm_pos;       /* next decoded stereo sample frame       */
+     int         is_mp3;
+diff --git a/recompiler/include/disc_chd.h b/recompiler/include/disc_chd.h
+new file mode 100644
+index 0000000..64cba4c
+--- /dev/null
++++ b/recompiler/include/disc_chd.h
+@@ -0,0 +1,27 @@
++/* disc_chd.h — read a Saturn CD image stored as a MAME .chd (via libchdr).
++ *
++ * The CHD is presented as ONE virtual BIN: every track's 2352-byte sectors in
++ * order, exactly the file `chdman extractcd` would write. disc.c then treats it
++ * like a single-BIN cue (the cue text comes from chd_image_cue()), so track
++ * layout, pregap and sector handling are the code paths cue/bin images already use.
++ */
++#ifndef DISC_CHD_H
++#define DISC_CHD_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++typedef struct chd_image chd_image;
++
++/* Returns 0 on success; on failure fills err. */
++int       chd_image_open(const char *path, chd_image **out, char *err, size_t errn);
++void      chd_image_close(chd_image *c);
++/* Size in bytes of the virtual BIN. */
++uint64_t  chd_image_size(const chd_image *c);
++/* Read n bytes at byte offset off of the virtual BIN. Returns 0 on success. */
++int       chd_image_read(chd_image *c, uint64_t off, void *buf, size_t n);
++/* The cue sheet chdman would write for this image, naming the BIN `bin_name`.
++ * malloc'd; free() it. NULL on failure. */
++char     *chd_image_cue(const chd_image *c, const char *bin_name);
++
++#endif
+diff --git a/recompiler/src/disc.c b/recompiler/src/disc.c
+index 5097633..bb56ff7 100644
+--- a/recompiler/src/disc.c
++++ b/recompiler/src/disc.c
+@@ -3,6 +3,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <ctype.h>
++#ifdef DISC_WITH_CHD
++#include "disc_chd.h"
++#endif
+ 
+ #ifdef _WIN32
+ #define WIN32_LEAN_AND_MEAN
+@@ -140,6 +143,15 @@ static int mp3_open_file(disc *d, disc_file *df)
+ }
+ #endif
+ 
++static int path_is_chd(const char *path)
++{
++    size_t n = strlen(path);
++    return n >= 5 && path[n - 4] == '.' &&
++           tolower((unsigned char)path[n - 3]) == 'c' &&
++           tolower((unsigned char)path[n - 2]) == 'h' &&
++           tolower((unsigned char)path[n - 1]) == 'd';
++}
++
+ static int path_is_mp3(const char *path)
+ {
+     size_t n = strlen(path);
+@@ -167,12 +179,36 @@ static int open_bin(disc *d, const char *path)
+     return 0;
+ }
+ 
++#ifdef DISC_WITH_CHD
++/* A .chd is exposed as one virtual BIN (see disc_chd.h). */
++static int open_chd_file(disc *d, chd_image *img, const char *path)
++{
++    disc_file *df;
++    if (d->nfiles >= (int)(sizeof(d->files)/sizeof(d->files[0]))) return -1;
++    df = &d->files[d->nfiles];
++    df->chd = img;
++    snprintf(df->path, sizeof(df->path), "%s", path);
++    df->size = chd_image_size(img);
++    d->nfiles++;
++    return 0;
++}
++#endif
++
++/* Read n bytes at byte offset off of a disc file (a real file or a CHD). 0 on success. */
++static int df_read(disc_file *df, uint64_t off, void *buf, size_t n)
++{
++#ifdef DISC_WITH_CHD
++    if (df->chd) return chd_image_read((chd_image *)df->chd, off, buf, n);
++#endif
++    if (fseek(df->fp, (long)off, SEEK_SET) != 0) return -1;
++    return fread(buf, 1, n, df->fp) == n ? 0 : -1;
++}
++
+ /* Probe a file for 2352-byte sectors by looking for the sync pattern. */
+ static uint32_t detect_sector_size(disc_file *df)
+ {
+     uint8_t buf[12];
+-    if (fseek(df->fp, 0, SEEK_SET) != 0) return 2048;
+-    if (fread(buf, 1, 12, df->fp) != 12) return 2048;
++    if (df_read(df, 0, buf, 12) != 0) return 2048;
+     return memcmp(buf, SYNC12, 12) == 0 ? 2352u : 2048u;
+ }
+ 
+@@ -196,21 +232,37 @@ static void resolve_rel(const char *cue_path, const char *name, char *out, size_
+     }
+ }
+ 
+-static int parse_cue(disc *d, const char *cue_path)
++/* Next line from a memory buffer, advancing *mem. NULL at the end. */
++static char *mem_gets(char *line, size_t n, const char **mem)
++{
++    const char *p = *mem;
++    size_t i = 0;
++    if (!*p) return NULL;
++    while (*p && *p != '\n' && i + 1 < n) line[i++] = *p++;
++    if (*p == '\n') line[i++] = *p++;
++    line[i] = 0;
++    *mem = p;
++    return line;
++}
++
++/* Parse a cue sheet from a file, or from `text` when it is non-NULL (the sheet
++ * generated for a .chd, whose single FILE entry is the CHD's virtual BIN). */
++static int parse_cue(disc *d, const char *cue_path, const char *text, void *chd)
+ {
+-    FILE *f = fopen(cue_path, "r");
++    FILE *f = text ? NULL : fopen(cue_path, "r");
+     char line[1024];
+     int cur_track = -1;
+     uint32_t pending_pregap = 0;
+ 
+-    if (!f) { snprintf(d->err, sizeof(d->err), "cannot open cue: %s", cue_path); return -1; }
++    if (!f && !text) { snprintf(d->err, sizeof(d->err), "cannot open cue: %s", cue_path); return -1; }
+ 
+-    while (fgets(line, sizeof(line), f)) {
++    while (text ? mem_gets(line, sizeof(line), &text) : fgets(line, sizeof(line), f)) {
+         char *p = line;
+         while (*p == ' ' || *p == '\t') p++;
+ 
+         if (strncmp(p, "FILE", 4) == 0) {
+             char name[512] = {0}, full[1024];
++            (void)chd;
+             const char *q = strchr(p, '"');
+             if (q) {
+                 const char *e = strchr(q + 1, '"');
+@@ -220,6 +272,12 @@ static int parse_cue(disc *d, const char *cue_path)
+                 }
+             }
+             if (!name[0]) continue;
++#ifdef DISC_WITH_CHD
++            if (chd) {
++                if (open_chd_file(d, (chd_image *)chd, cue_path) != 0) return -1;
++                continue;
++            }
++#endif
+             resolve_rel(cue_path, name, full, sizeof(full));
+             if (open_bin(d, full) != 0) {
+                 snprintf(d->err, sizeof(d->err), "cue references missing file: %.200s", full);
+@@ -260,7 +318,7 @@ static int parse_cue(disc *d, const char *cue_path)
+                 d->tracks[cur_track].start_lba = msf_to_frames(m, s, fr);
+         }
+     }
+-    fclose(f);
++    if (f) fclose(f);
+     return d->ntracks ? 0 : -1;
+ }
+ 
+@@ -330,7 +388,26 @@ int disc_open(disc *d, const char *path)
+     memset(d, 0, sizeof(*d));
+ 
+     if (n > 4 && (strcmp(path + n - 4, ".cue") == 0 || strcmp(path + n - 4, ".CUE") == 0)) {
+-        if (parse_cue(d, path) != 0) return -1;
++        if (parse_cue(d, path, NULL, NULL) != 0) return -1;
++    } else if (path_is_chd(path)) {
++#ifdef DISC_WITH_CHD
++        chd_image *img = NULL;
++        char *cue;
++        int rc;
++        if (chd_image_open(path, &img, d->err, sizeof(d->err)) != 0) return -1;
++        cue = chd_image_cue(img, "image.bin");
++        if (!cue) { chd_image_close(img); snprintf(d->err, sizeof(d->err), "out of memory"); return -1; }
++        rc = parse_cue(d, path, cue, img);
++        free(cue);
++        if (rc != 0 || !d->nfiles) {
++            if (!d->nfiles) chd_image_close(img);
++            if (!d->err[0]) snprintf(d->err, sizeof(d->err), "cannot read the CD layout of %.200s", path);
++            return -1;
++        }
++#else
++        snprintf(d->err, sizeof(d->err), "this build of SaturnRecomp cannot read .chd images (convert it to .cue/.bin): %.150s", path);
++        return -1;
++#endif
+     } else {
+         disc_track *t;
+         if (open_bin(d, path) != 0) {
+@@ -399,6 +476,9 @@ void disc_close(disc *d)
+         }
+ #endif
+         if (d->files[i].fp) fclose(d->files[i].fp);
++#ifdef DISC_WITH_CHD
++        if (d->files[i].chd) chd_image_close((chd_image *)d->files[i].chd);
++#endif
+     }
+     memset(d, 0, sizeof(*d));
+ }
+@@ -463,14 +543,12 @@ int disc_read_sector(disc *d, uint32_t lba, void *out2048, track_mode *out_mode)
+     if (t->sector_size == 2048) {
+         off = (uint64_t)file_lba * 2048u;
+         if (off + 2048 > df->size) return -1;
+-        if (fseek(df->fp, (long)off, SEEK_SET) != 0) return -1;
+-        return fread(out2048, 1, 2048, df->fp) == 2048 ? 0 : -1;
++        return df_read(df, off, out2048, 2048);
+     }
+ 
+     off = (uint64_t)file_lba * 2352u;
+     if (off + 2352 > df->size) return -1;
+-    if (fseek(df->fp, (long)off, SEEK_SET) != 0) return -1;
+-    if (fread(raw, 1, 2352, df->fp) != 2352) return -1;
++    if (df_read(df, off, raw, 2352) != 0) return -1;
+ 
+     /* Detect the real mode from the sector itself; cue sheets lie. */
+     if (memcmp(raw, SYNC12, 12) != 0) {
+@@ -532,8 +610,7 @@ int disc_read_raw(disc *d, uint32_t lba, void *out2352)
+     }
+     off = (uint64_t)file_lba * 2352u;
+     if (off + 2352 > df->size) return -1;
+-    if (fseek(df->fp, (long)off, SEEK_SET) != 0) return -1;
+-    return fread(out2352, 1, 2352, df->fp) == 2352 ? 0 : -1;
++    return df_read(df, off, out2352, 2352);
+ }
+ 
+ size_t disc_read(disc *d, uint32_t lba, void *out, size_t size)
+diff --git a/recompiler/src/disc_chd.c b/recompiler/src/disc_chd.c
+new file mode 100644
+index 0000000..b600e21
+--- /dev/null
++++ b/recompiler/src/disc_chd.c
+@@ -0,0 +1,202 @@
++/* disc_chd.c — see disc_chd.h. */
++#include "disc_chd.h"
++#include <libchdr/chd.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define CHD_UNIT      2448u   /* 2352 sector + 96 subcode */
++#define SECTOR        2352u
++#define TRACK_PAD     4u      /* each track is padded to a multiple of 4 frames in the CHD */
++#define MAX_TRACKS    99
++#define CACHE_HUNKS   4
++
++typedef struct {
++    int      num;
++    int      audio;
++    int      mode2;
++    uint32_t frames;        /* frames the track contributes to the virtual BIN */
++    uint32_t pregap;        /* PREGAP frames */
++    uint32_t vstart;        /* first virtual-BIN frame of the track */
++    uint32_t chd_start;     /* first CHD frame of the track */
++} chd_track;
++
++typedef struct {
++    uint8_t *data;
++    int64_t  hunk;          /* -1 when empty */
++    uint64_t stamp;
++} hunk_slot;
++
++struct chd_image {
++    chd_file  *chd;
++    uint32_t   hunkbytes;
++    uint32_t   frames_per_hunk;
++    chd_track  tracks[MAX_TRACKS];
++    int        ntracks;
++    uint32_t   total_frames;   /* virtual BIN frames */
++    hunk_slot  cache[CACHE_HUNKS];
++    uint64_t   clock;
++};
++
++static void set_err(char *err, size_t n, const char *fmt, const char *a) {
++    if (err && n) snprintf(err, n, fmt, a ? a : "");
++}
++
++static int parse_tracks(chd_image *c, char *err, size_t errn) {
++    uint32_t pad_total = 0, virt_total = 0;
++    for (uint32_t i = 0; i < MAX_TRACKS; i++) {
++        char meta[512], type[32] = {0}, sub[32] = {0}, pgtype[32] = {0}, pgsub[32] = {0};
++        uint32_t len = 0;
++        int trk = 0, frames = 0, pregap = 0, postgap = 0;
++        chd_error e = chd_get_metadata(c->chd, CDROM_TRACK_METADATA2_TAG, i, meta, sizeof(meta) - 1, &len, NULL, NULL);
++        chd_track *t;
++        if (e == CHDERR_NONE) {
++            meta[len < sizeof(meta) ? len : sizeof(meta) - 1] = 0;
++            if (sscanf(meta, "TRACK:%d TYPE:%31s SUBTYPE:%31s FRAMES:%d PREGAP:%d PGTYPE:%31s PGSUB:%31s POSTGAP:%d",
++                       &trk, type, sub, &frames, &pregap, pgtype, pgsub, &postgap) < 5) {
++                set_err(err, errn, "unreadable track metadata in the CHD%s", "");
++                return -1;
++            }
++        } else {
++            e = chd_get_metadata(c->chd, CDROM_TRACK_METADATA_TAG, i, meta, sizeof(meta) - 1, &len, NULL, NULL);
++            if (e != CHDERR_NONE) break;   /* no more tracks */
++            meta[len < sizeof(meta) ? len : sizeof(meta) - 1] = 0;
++            if (sscanf(meta, "TRACK:%d TYPE:%31s SUBTYPE:%31s FRAMES:%d", &trk, type, sub, &frames) < 4) {
++                set_err(err, errn, "unreadable track metadata in the CHD%s", "");
++                return -1;
++            }
++        }
++        if (frames <= 0) { set_err(err, errn, "the CHD has an empty track%s", ""); return -1; }
++        t = &c->tracks[c->ntracks];
++        memset(t, 0, sizeof(*t));
++        t->num    = trk;
++        t->frames = (uint32_t)frames;
++        t->pregap = pregap > 0 ? (uint32_t)pregap : 0;
++        if (strcmp(type, "AUDIO") == 0)           t->audio = 1;
++        else if (strcmp(type, "MODE1_RAW") == 0)  t->mode2 = 0;
++        else if (strcmp(type, "MODE2_RAW") == 0)  t->mode2 = 1;
++        else {
++            set_err(err, errn, "the CHD has a %s track; only raw (2352-byte) CD images are supported", type);
++            return -1;
++        }
++        /* The pregap frames are part of FRAMES: the reference BIN from chdman extractcd stores
++         * them (checked on a real Saturn disc whose PGTYPE reads VAUDIO). */
++        t->vstart    = virt_total;
++        t->chd_start = pad_total;
++        virt_total  += t->frames;
++        pad_total   += (t->frames + TRACK_PAD - 1) / TRACK_PAD * TRACK_PAD;
++        c->ntracks++;
++    }
++    if (!c->ntracks) { set_err(err, errn, "the CHD holds no CD track metadata (is it a CD image?)%s", ""); return -1; }
++    c->total_frames = virt_total;
++    return 0;
++}
++
++int chd_image_open(const char *path, chd_image **out, char *err, size_t errn) {
++    chd_image *c = (chd_image *)calloc(1, sizeof(*c));
++    const chd_header *h;
++    chd_error e;
++    if (!c) { set_err(err, errn, "out of memory%s", ""); return -1; }
++    e = chd_open(path, CHD_OPEN_READ, NULL, &c->chd);
++    if (e != CHDERR_NONE) {
++        set_err(err, errn, "cannot open the CHD: %s", chd_error_string(e));
++        free(c);
++        return -1;
++    }
++    h = chd_get_header(c->chd);
++    if (!h || h->unitbytes != CHD_UNIT || h->hunkbytes == 0 || h->hunkbytes % CHD_UNIT) {
++        set_err(err, errn, "that CHD is not a CD image%s", "");
++        chd_close(c->chd); free(c);
++        return -1;
++    }
++    c->hunkbytes = h->hunkbytes;
++    c->frames_per_hunk = h->hunkbytes / CHD_UNIT;
++    if (parse_tracks(c, err, errn) != 0) { chd_close(c->chd); free(c); return -1; }
++    for (int i = 0; i < CACHE_HUNKS; i++) {
++        c->cache[i].data = (uint8_t *)malloc(c->hunkbytes);
++        c->cache[i].hunk = -1;
++        if (!c->cache[i].data) { chd_image_close(c); set_err(err, errn, "out of memory%s", ""); return -1; }
++    }
++    *out = c;
++    return 0;
++}
++
++void chd_image_close(chd_image *c) {
++    if (!c) return;
++    for (int i = 0; i < CACHE_HUNKS; i++) free(c->cache[i].data);
++    if (c->chd) chd_close(c->chd);
++    free(c);
++}
++
++uint64_t chd_image_size(const chd_image *c) { return (uint64_t)c->total_frames * SECTOR; }
++
++static const uint8_t *get_hunk(chd_image *c, uint32_t hunk) {
++    hunk_slot *victim = &c->cache[0];
++    for (int i = 0; i < CACHE_HUNKS; i++) {
++        if (c->cache[i].hunk == (int64_t)hunk) { c->cache[i].stamp = ++c->clock; return c->cache[i].data; }
++        if (c->cache[i].stamp < victim->stamp) victim = &c->cache[i];
++    }
++    if (chd_read(c->chd, hunk, victim->data) != CHDERR_NONE) { victim->hunk = -1; return NULL; }
++    victim->hunk = (int64_t)hunk;
++    victim->stamp = ++c->clock;
++    return victim->data;
++}
++
++/* One 2352-byte sector of the virtual BIN, as chdman extractcd would write it. */
++static int read_frame(chd_image *c, uint32_t vframe, uint8_t *out) {
++    const chd_track *t = NULL;
++    for (int i = c->ntracks - 1; i >= 0; i--)
++        if (c->tracks[i].vstart <= vframe) { t = &c->tracks[i]; break; }
++    if (!t || vframe >= t->vstart + t->frames) return -1;
++    {
++        uint32_t cf = t->chd_start + (vframe - t->vstart);
++        const uint8_t *hd = get_hunk(c, cf / c->frames_per_hunk);
++        if (!hd) return -1;
++        memcpy(out, hd + (size_t)(cf % c->frames_per_hunk) * CHD_UNIT, SECTOR);
++    }
++    if (t->audio) {   /* the CHD keeps CD audio big-endian; a BIN holds little-endian samples */
++        for (unsigned i = 0; i < SECTOR; i += 2) { uint8_t a = out[i]; out[i] = out[i + 1]; out[i + 1] = a; }
++    }
++    return 0;
++}
++
++int chd_image_read(chd_image *c, uint64_t off, void *buf, size_t n) {
++    uint8_t *o = (uint8_t *)buf;
++    uint8_t sec[SECTOR];
++    if (off + n > chd_image_size(c)) return -1;
++    while (n) {
++        uint32_t frame = (uint32_t)(off / SECTOR);
++        size_t   in    = (size_t)(off % SECTOR);
++        size_t   take  = SECTOR - in < n ? SECTOR - in : n;
++        if (read_frame(c, frame, sec) != 0) return -1;
++        memcpy(o, sec + in, take);
++        o += take; off += take; n -= take;
++    }
++    return 0;
++}
++
++static void msf(char *out, size_t n, uint32_t f) {
++    snprintf(out, n, "%02u:%02u:%02u", f / (60 * 75), (f / 75) % 60, f % 75);
++}
++
++char *chd_image_cue(const chd_image *c, const char *bin_name) {
++    size_t cap = 256 + (size_t)c->ntracks * 160 + strlen(bin_name);
++    char *s = (char *)malloc(cap), *p = s;
++    char a[16], b[16];
++    if (!s) return NULL;
++    p += snprintf(p, cap, "FILE \"%s\" BINARY\n", bin_name);
++    for (int i = 0; i < c->ntracks; i++) {
++        const chd_track *t = &c->tracks[i];
++        uint32_t idx1 = t->vstart;
++        p += snprintf(p, cap - (size_t)(p - s), "  TRACK %02d %s\n", t->num,
++                      t->audio ? "AUDIO" : (t->mode2 ? "MODE2/2352" : "MODE1/2352"));
++        if (t->pregap) {
++            msf(a, sizeof a, t->vstart);
++            p += snprintf(p, cap - (size_t)(p - s), "    INDEX 00 %s\n", a);
++            idx1 += t->pregap;
++        }
++        msf(b, sizeof b, idx1);
++        p += snprintf(p, cap - (size_t)(p - s), "    INDEX 01 %s\n", b);
++    }
++    return s;
++}
+diff --git a/tools/build_runtime.ps1 b/tools/build_runtime.ps1
+index 9b989f1..0152ff4 100644
+--- a/tools/build_runtime.ps1
++++ b/tools/build_runtime.ps1
+@@ -17,6 +17,10 @@ $mingw=$env:SATURN_MINGW_BIN
+ if(-not $mingw){$mingw='C:\msys64\mingw64\bin'}
+ $env:PATH=$mingw+';'+$env:PATH
+ $flags=@('-O3','-flto','-march=native','-mtune=native','-std=c11','-Irunner/include','-Irecompiler/include','-Iexternal/sh2-recomp-core/common')
++# .chd disc images: when setup has fetched libchdr into external/libchdr, build it in.
++# zlib and zstd come from MSYS2 (linked statically); LZMA and FLAC decoding ship with libchdr.
++$chd=Test-Path 'external/libchdr/src/libchdr_chd.c'
++if($chd){$flags+=@('-DDISC_WITH_CHD','-DCHDR_SYSTEM_ZLIB','-DCHDR_SYSTEM_ZSTD','-DWANT_RAW_DATA_SECTOR=1','-DWANT_SUBCODE=1','-DVERIFY_BLOCK_CRC=1','-Iexternal/libchdr/include','-Iexternal/libchdr/deps/lzma-26.02/include')}
+ New-Item -ItemType Directory -Force -Path $ObjectDir,$ProfileDir,(Split-Path -Parent $Output),(Split-Path -Parent $BootOutput) | Out-Null
+ $profileAbs=(Resolve-Path $ProfileDir).Path.Replace('\','/')
+ if($Profile -eq 'use' -and -not (Get-ChildItem $ProfileDir -Recurse -Filter '*.gcda')){throw 'No gameplay profile found; generate, run a game, then use.'}
+@@ -26,6 +30,11 @@ if($Profile -eq 'use'){$coreProfile+=@('-fprofile-correction','-Werror=missing-p
+ $profiledCores=@('sh2_interp','m68k','scsp','scsp_dsp')
+ $sources=@('bus','scu_dsp','sh2_interp','bios','cdblock','vdp1','debugview','vdp2','m68k','m68k_bus','scsp','scsp_dsp','sound','png','smpc','boot','window','vulkan_renderer','runtime_settings','game_overlay','game_overlay_vk') | ForEach-Object {"runner/src/$_.c"}
+ $sources+=@('recompiler/src/disc.c','recompiler/src/game_config.c','external/sh2-recomp-core/common/sh2_decoder.c')
++if($chd){
++    $sources+='recompiler/src/disc_chd.c'
++    $sources+=@(Get-ChildItem 'external/libchdr/src' -Filter 'libchdr_*.c' | Sort-Object Name | ForEach-Object {"external/libchdr/src/$($_.Name)"})
++    $sources+='external/libchdr/deps/lzma-26.02/src/LzmaDec.c'
++}
+ $objects=@()
+ foreach($source in $sources){
+     $name=[IO.Path]::GetFileNameWithoutExtension($source)
+@@ -38,6 +47,7 @@ foreach($source in $sources){
+ }
+ $link=@()
+ if($Profile -eq 'generate'){$link+='-lgcov'}
++if($chd){$link+=@('-Wl,-Bstatic','-lzstd','-lz','-Wl,-Bdynamic')}
+ $windowObjects=@($objects | Where-Object { [IO.Path]::GetFileName($_) -ne 'boot.o' })
+ $bootObjects=@($objects | Where-Object { [IO.Path]::GetFileName($_) -notin @('window.o','vulkan_renderer.o','game_overlay.o','game_overlay_vk.o') })
+ & gcc @flags '-Wl,--stack,67108864' @bootObjects @link -o $BootOutput
+diff --git a/tools/chdcheck.c b/tools/chdcheck.c
+new file mode 100644
+index 0000000..dbf3764
+--- /dev/null
++++ b/tools/chdcheck.c
+@@ -0,0 +1,27 @@
++/* chdcheck <image.chd> <product-no>: exit 0 if the CHD is a Saturn disc with that product number.
++ * Setup uses it to refuse the wrong game before it spends minutes building. */
++#include "disc_chd.h"
++#include <stdio.h>
++#include <string.h>
++
++int main(int argc, char **argv)
++{
++    chd_image *c = NULL;
++    char err[256] = {0};
++    uint8_t buf[64];
++    char product[11] = {0};
++
++    if (argc != 3) { fprintf(stderr, "usage: chdcheck <image.chd> <product-no>\n"); return 2; }
++    if (chd_image_open(argv[1], &c, err, sizeof(err)) != 0) { fprintf(stderr, "That CHD is not a Sega Saturn disc image (%s).\n", err); return 1; }
++    /* First data sector is raw: 16 bytes of sync and header, then the IP.BIN header. */
++    if (chd_image_read(c, 16, buf, sizeof(buf)) != 0) { fprintf(stderr, "That CHD is not a Sega Saturn disc image (its first sector cannot be read).\n"); chd_image_close(c); return 1; }
++    chd_image_close(c);
++    if (memcmp(buf, "SEGA SEGASATURN", 15) != 0) { fprintf(stderr, "That CHD is not a Sega Saturn disc image.\n"); return 1; }
++    memcpy(product, buf + 0x20, 10);
++    for (int i = 9; i >= 0 && (product[i] == ' ' || product[i] == 0); i--) product[i] = 0;
++    if (strncmp(product, argv[2], strlen(argv[2])) != 0) {
++        fprintf(stderr, "That CHD is %s, not Baroque (%s).\n", product, argv[2]);
++        return 1;
++    }
++    return 0;
++}
