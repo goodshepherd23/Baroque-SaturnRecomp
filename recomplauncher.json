@@ -26,6 +26,131 @@
   "start": {
     "program": ["Baroque.exe"]
   },
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": [
+        {"path": "{install}/settings.ini", "if": "{install}/portable.txt"},
+        {"path": "{local}/Baroque-SaturnRecomp/settings.ini"}
+      ]
+    }
+  ],
+  "settings": [
+    {
+      "id": "window",
+      "label": "Window mode",
+      "group": "Picture",
+      "help": "Borderless fullscreen uses your desktop resolution.",
+      "choices": [
+        {"label": "Windowed", "set": {"Video/Fullscreen": "0"}},
+        {"label": "Borderless fullscreen", "set": {"Video/Fullscreen": "1"}}
+      ],
+      "defaults": {"Video/Fullscreen": "1"}
+    },
+    {
+      "id": "scale",
+      "label": "Internal resolution",
+      "group": "Picture",
+      "help": "Times the Saturn's own resolution. 6x draws at about 1440p; 3x is smooth on a laptop. Lower it if the dungeon stutters.",
+      "slider": {"key": "Video/InternalScale", "min": 1, "max": 8, "step": 1, "format": "%g"},
+      "defaults": {"Video/InternalScale": "1"}
+    },
+    {
+      "id": "filter",
+      "label": "Texture filtering",
+      "group": "Picture",
+      "help": "Smooth textures instead of original pixels. Only has an effect above 1x.",
+      "choices": [
+        {"label": "Original pixels", "set": {"Video/TextureFilter": "0"}},
+        {"label": "Smooth", "set": {"Video/TextureFilter": "1"}}
+      ],
+      "defaults": {"Video/TextureFilter": "0"}
+    },
+    {
+      "id": "aa",
+      "label": "Anti-aliasing",
+      "group": "Picture",
+      "help": "FXAA. Only has an effect above 1x.",
+      "choices": [
+        {"label": "Off", "set": {"Video/Antialiasing": "0"}},
+        {"label": "FXAA", "set": {"Video/Antialiasing": "1"}}
+      ],
+      "defaults": {"Video/Antialiasing": "0"}
+    },
+    {
+      "id": "smooth",
+      "label": "Smooth model edges",
+      "group": "Picture",
+      "advanced": true,
+      "help": "Supersampled polygon edges. Applies up to 4x.",
+      "choices": [
+        {"label": "Off", "set": {"Video/ModelSmoothing": "0"}},
+        {"label": "On", "set": {"Video/ModelSmoothing": "1"}}
+      ],
+      "defaults": {"Video/ModelSmoothing": "0"}
+    },
+    {
+      "id": "wide",
+      "label": "Widescreen",
+      "group": "Picture",
+      "help": "16:9 view. Also choose Settings > TV Type > Wide in the game. Menus and movies look stretched, as on a widescreen TV of the time.",
+      "choices": [
+        {"label": "4:3", "set": {"Video/Widescreen": "0"}},
+        {"label": "16:9", "set": {"Video/Widescreen": "1"}}
+      ],
+      "defaults": {"Video/Widescreen": "0"}
+    },
+    {
+      "id": "interp",
+      "label": "Frame interpolation",
+      "group": "Picture",
+      "help": "Smoother motion between the game's original frames, drawn at this rate.",
+      "choices": [
+        {"label": "Off", "set": {"Video/Interpolation": "0"}},
+        {"label": "60 Hz", "set": {"Video/Interpolation": "60", "Video/TargetHz": "60"}},
+        {"label": "90 Hz", "set": {"Video/Interpolation": "90", "Video/TargetHz": "90"}},
+        {"label": "120 Hz", "set": {"Video/Interpolation": "120", "Video/TargetHz": "120"}},
+        {"label": "144 Hz", "set": {"Video/Interpolation": "144", "Video/TargetHz": "144"}},
+        {"label": "165 Hz", "set": {"Video/Interpolation": "165", "Video/TargetHz": "165"}},
+        {"label": "240 Hz", "set": {"Video/Interpolation": "240", "Video/TargetHz": "240"}}
+      ],
+      "defaults": {"Video/Interpolation": "0", "Video/TargetHz": "120"}
+    },
+    {
+      "id": "volume",
+      "label": "Volume",
+      "group": "Audio",
+      "slider": {"key": "Audio/Volume", "min": 0, "max": 100, "step": 5, "format": "%g"},
+      "defaults": {"Audio/Volume": "100"}
+    },
+    {
+      "id": "mute",
+      "label": "Sound",
+      "group": "Audio",
+      "choices": [
+        {"label": "On", "set": {"Audio/Muted": "0"}},
+        {"label": "Muted", "set": {"Audio/Muted": "1"}}
+      ],
+      "defaults": {"Audio/Muted": "0"}
+    },
+    {
+      "id": "buffer",
+      "label": "Audio buffer",
+      "group": "Audio",
+      "advanced": true,
+      "help": "Frames of sound kept queued. Lower reduces delay; higher helps a slower PC. Applies on the next start.",
+      "choices": [
+        {"label": "256", "set": {"Audio/AudioBuffer": "256"}},
+        {"label": "512", "set": {"Audio/AudioBuffer": "512"}},
+        {"label": "1024", "set": {"Audio/AudioBuffer": "1024"}},
+        {"label": "2048", "set": {"Audio/AudioBuffer": "2048"}},
+        {"label": "4096", "set": {"Audio/AudioBuffer": "4096"}},
+        {"label": "8192", "set": {"Audio/AudioBuffer": "8192"}}
+      ],
+      "defaults": {"Audio/AudioBuffer": "2048"}
+    }
+  ],
   "saves": [
     "{local}/Baroque-SaturnRecomp/game/backup.bin",
     "{local}/Baroque-SaturnRecomp/settings.ini"

@@ -233,6 +233,11 @@ will ask for it again after an update.
 `.chd` or `.iso`) and the BIOS on its setup screen, run setup without windows, and start
 the game. They call the same `kit\setup.ps1` as `Baroque.exe`.
 
+The launcher's game page also shows the options from `settings.ini`: window mode, internal
+resolution (1x to 8x), texture filtering, FXAA, model smoothing, widescreen, frame interpolation,
+volume, mute and the audio buffer. It edits the same file F1 does, in the data folder (or beside
+`Baroque.exe` with `portable.txt`), so both always agree.
+
 ## Legal
 
 This project is not affiliated with or endorsed by Sega, Sting or the
