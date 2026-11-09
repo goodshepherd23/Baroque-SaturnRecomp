@@ -74,7 +74,7 @@ Write-Host "BIOS: $biosDst"
 
 function Test-BaroqueCue([string]$cue) {
     $dir = Split-Path -Parent $cue
-    $files = Select-String -LiteralPath $cue -Pattern '^\s*FILE\s+"(.+)"' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+    $files = @(Select-String -LiteralPath $cue -Pattern '^\s*FILE\s+"(.+)"' | ForEach-Object { $_.Matches[0].Groups[1].Value })
     if (-not $files) { throw "No FILE lines in $cue" }
     foreach ($f in $files) { if (-not (Test-Path -LiteralPath (Join-Path $dir $f))) { throw "The cue sheet needs '$f' next to it." } }
     $first = Join-Path $dir $files[0]
