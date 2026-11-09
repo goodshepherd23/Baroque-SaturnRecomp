@@ -227,6 +227,12 @@ will ask for it again after an update.
 - **The game stopped with an error:** see `game\runtime.log` in the data folder.
 - **Slowdown:** lower the internal resolution in F1 (3x is smooth on Intel Iris Xe), close other heavy programs, and on a laptop, plug in.
 
+## RecompLauncher
+
+`recomplauncher.json` and `prepare-baroque.cmd` let RecompLauncher ask for the disc (`.cue`,
+`.chd` or `.iso`) and the BIOS on its setup screen, run setup without windows, and start
+the game. They call the same `kit\setup.ps1` as `Baroque.exe`.
+
 ## Legal
 
 This project is not affiliated with or endorsed by Sega, Sting or the

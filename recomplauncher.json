@@ -1,0 +1,33 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "Baroque",
+  "repo": "goodshepherd23/Baroque-SaturnRecomp",
+  "inputs": [
+    {
+      "id": "disc",
+      "label": "Baroque (Japan), T-33901G: your disc image as a .cue (with its .bin files beside it), a .chd or an .iso.",
+      "role": "disc",
+      "formats": [{"type": "file", "extensions": ["cue", "chd", "iso"]}]
+    },
+    {
+      "id": "bios",
+      "label": "Your Sega Saturn BIOS (512 KB .bin). A Japanese one is recommended for this game.",
+      "role": "game",
+      "formats": [{"type": "file", "extensions": ["bin"]}]
+    }
+  ],
+  "prepare": {
+    "program": ["prepare-baroque.cmd"],
+    "args": ["-Disc", "{input:disc}", "-Bios", "{input:bios}", "-Install", "{install}", "-Local", "{local}"],
+    "label": "Checking your disc and BIOS, then building the runtime (needs internet, about 10 minutes the first time)",
+    "timeout": 3600
+  },
+  "start": {
+    "program": ["Baroque.exe"]
+  },
+  "saves": [
+    "{local}/Baroque-SaturnRecomp/game/backup.bin",
+    "{local}/Baroque-SaturnRecomp/settings.ini"
+  ]
+}

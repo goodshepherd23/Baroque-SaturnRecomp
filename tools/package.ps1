@@ -18,6 +18,7 @@ if ($LASTEXITCODE -ne 0) { throw 'launcher build failed' }
 Copy-Item -LiteralPath "$repo\kit" -Destination "$stage\kit" -Recurse
 Remove-Item -LiteralPath "$stage\kit\setup.log" -ErrorAction SilentlyContinue
 Copy-Item -LiteralPath "$repo\README.md", "$repo\LICENSE" -Destination $stage
+Copy-Item -LiteralPath "$repo\recomplauncher.json", "$repo\prepare-baroque.cmd" -Destination $stage
 
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip }
 Compress-Archive -Path "$stage\*" -DestinationPath $zip
