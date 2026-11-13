@@ -91,6 +91,18 @@ of frames late, the same as 1x. 4x had 15% late frames and 5x had 29%. A
 dedicated graphics card should manage 6x or more. If the dungeon stutters,
 lower the scale.
 
+## Frame interpolation
+
+Baroque draws a new 3D picture every third display field, about 20 fps, like
+the Saturn original. **F1 > Motion > Frame interpolation** (or **F2**) draws the frames in
+between, so walking and turning look smooth at 60 Hz or more. Menus, text and
+the HUD still update at the game's own rate.
+
+Before v0.1.6 this setting did almost nothing in the dungeon: it repeated each
+game frame, which only made camera motion look blurrier. When a wall or object
+comes into or leaves view, that part of the picture holds still for one game
+frame rather than risk a torn seam.
+
 ## Widescreen
 
 Baroque has a built-in anamorphic widescreen mode for 16:9 TVs. To use it:
@@ -152,6 +164,10 @@ are in `kit\patches` and were offered back to the author in
 - **Upscaling in the dungeon.** Baroque clears the screen there with a full-screen
   polygon instead of the VDP1 erase, so upscaling, texture filtering and FXAA
   fell back to the native picture. A full-screen opaque polygon now counts as a clear.
+- **Frame interpolation in the dungeon.** Polygons were only paired between frames
+  when their colour-table address matched, but Baroque swaps lighting tables every
+  frame, and an edge shared by three faces froze the whole room. Both are fixed
+  (`0004-dungeon-interpolation.patch`).
 - **`.chd` disc images** (`0003-chd-disc-support.patch`). The disc layer reads a MAME CD
   `.chd` through [libchdr](https://github.com/rtissera/libchdr) (BSD-3-Clause, pinned in
   `kit\libchdr.sha256`) as if it were one BIN, so `.cue`/`.bin` and `.iso` behave exactly as

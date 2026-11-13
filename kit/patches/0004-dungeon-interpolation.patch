@@ -1,0 +1,130 @@
+Frame interpolation in the dungeon.
+
+The interpolator matched only 1 of ~108 dungeon polygons, so "interpolated"
+frames repeated the last game frame (Baroque draws a new 3D frame every third
+field, 20 fps). Two causes:
+
+1. Identity required the same colr (colour bank / lookup-table address).
+   Baroque double-buffers its lighting tables, so colr changes every frame.
+   Identity and the texture-reuse hash now ignore colour tables; the replay
+   always draws with the current frame's tables.
+2. geometry_weld held any edge shared by more than two faces, freezing the
+   whole connected room. Baroque's ceiling trim meets the wall panels above
+   and below it. Distinct faces on one edge are now allowed when all their
+   histories agree; stacked duplicate faces are still held, as before.
+
+tests/geometry_interp.c gains a three-face case.
+
+--- a/runner/include/geometry_interp.h
++++ b/runner/include/geometry_interp.h
+@@ -16,14 +16,16 @@ static inline int geometry_eligible(const saturn_vk_vdp1_op *o) {
+     unsigned type=(o->flip>>8)&15;
+     return o->kind==SATURN_VK_VDP1_QUAD && (type==2 || type==4);
+ }
+-/* Texture addresses may be reused for different uploads between frames. */
++/* Texture addresses may be reused for different uploads between frames.
++ * Only the texel data identifies a surface: colour lookup tables are lighting,
++ * and games double-buffer them (Baroque swaps tables every frame), so the
++ * replay always draws with the current frame's tables anyway. */
+ static inline uint32_t geometry_texture_hash(const saturn_vk_vdp1_op *o,const uint8_t *ram) {
+     unsigned mode=(o->pmod>>3)&7;
+     uint32_t count=o->tw*o->th,hash=2166136261u;
+     count=mode<=1 ? (count+1)/2 : mode<=4 ? count : count*2;
+     if(count>0x80000u)return 0;
+     for(uint32_t i=0;i<count;i++)hash=(hash^ram[(o->chr+i)&0x7FFFFu])*16777619u;
+-    if(mode==1)for(unsigned i=0;i<32;i++)hash=(hash^ram[(o->colr*8+i)&0x7FFFFu])*16777619u;
+     return hash;
+ }
+ static inline int64_t geometry_area(const saturn_vk_vdp1_op *o) {
+@@ -31,9 +33,12 @@ static inline int64_t geometry_area(const saturn_vk_vdp1_op *o) {
+     for(unsigned k=0;k<4;k++){unsigned j=(k+1)&3;area+=(int64_t)o->xy[k*2]*o->xy[j*2+1]-(int64_t)o->xy[j*2]*o->xy[k*2+1];}
+     return area;
+ }
++/* Identity ignores colr (colour bank or lookup-table address) for the same
++ * reason the texture hash ignores table contents: it moves with lighting
++ * buffers, not with the surface. The current op's colr is what gets drawn. */
+ static inline int geometry_same(const saturn_vk_vdp1_op *a,const saturn_vk_vdp1_op *b) {
+     if(!(geometry_eligible(a)&&geometry_eligible(b)&&a->textured==b->textured &&
+-        a->chr==b->chr&&a->tw==b->tw&&a->th==b->th&&a->colr==b->colr&&
++        a->chr==b->chr&&a->tw==b->tw&&a->th==b->th&&
+         a->pmod==b->pmod&&a->flat==b->flat&&a->flip==b->flip))return 0;
+     int64_t aa=geometry_area(a),ba=geometry_area(b);
+     return aa && ba && ((aa<0)==(ba<0));
+@@ -116,9 +121,9 @@ static inline int geometry_nearest(const saturn_vk_vdp1_op *a,const saturn_vk_vd
+  * full identity check; both reciprocal nearest choices share one distance. */
+ typedef struct {int best;int64_t first,second;} geometry_choice;
+ static inline uint32_t geometry_material_key(const saturn_vk_vdp1_op *o) {
+-    const uint32_t v[]={o->textured,o->chr,o->tw,o->th,o->colr,o->pmod,o->flat,o->flip};
++    const uint32_t v[]={o->textured,o->chr,o->tw,o->th,o->pmod,o->flat,o->flip};
+     uint32_t h=2166136261u;
+-    for(unsigned i=0;i<8;i++)h=(h^v[i])*16777619u;
++    for(unsigned i=0;i<7;i++)h=(h^v[i])*16777619u;
+     h^=h>>16;return h;
+ }
+ static inline void geometry_consider(geometry_choice *c,int index,int64_t d) {
+@@ -218,6 +223,27 @@ static inline int geometry_edge_close(const saturn_vk_vdp1_op *ops,
+     }
+     return 1;
+ }
++/* Two different faces whose histories agree on the edge are an ordinary seam.
++ * Three or more stay ambiguous when any two of them are the same polygon
++ * drawn twice (stacked faces cannot tell their histories apart), but distinct
++ * faces meeting along one screen edge are real geometry: Baroque's ceiling
++ * trim meets the wall panels above and below it, and holding those froze the
++ * whole connected room. `shape` is the picture the edges were taken from. */
++static inline int geometry_same_shape(const saturn_vk_vdp1_op *a,const saturn_vk_vdp1_op *b) {
++    for(unsigned k=0;k<8;k++)if(geometry_xy(a,k)!=geometry_xy(b,k))return 0;
++    return 1;
++}
++static inline int geometry_edge_group_ok(const saturn_vk_vdp1_op *shape,const saturn_vk_vdp1_op *other,
++    const geometry_edge *e,unsigned begin,unsigned end,float limit) {
++    for(unsigned j=begin+1;j<end;j++) {
++        for(unsigned k=begin;k<j;k++) {
++            if(e[k].face==e[j].face)return 0;
++            if(end-begin>2 && geometry_same_shape(&shape[e[k].face],&shape[e[j].face]))return 0;
++        }
++        if(!geometry_edge_close(other,&e[begin],&e[j],limit))return 0;
++    }
++    return 1;
++}
+ static inline unsigned geometry_weld(const saturn_vk_vdp1_op *cur,unsigned n,saturn_vk_vdp1_op *old) {
+     if(!n||n>8192)return 0;
+     unsigned changed=0;
+@@ -238,8 +264,7 @@ static inline unsigned geometry_weld(const saturn_vk_vdp1_op *cur,unsigned n,sat
+         while(end<ne&&!geometry_edge_compare(&edges[i],&edges[end]))end++;
+         if(end>i+1) {
+             for(unsigned j=i+1;j<end;j++)geometry_join(parent,edges[i].face,edges[j].face);
+-            if(end!=i+2 || edges[i].face==edges[i+1].face ||
+-               !geometry_edge_close(old,&edges[i],&edges[i+1],0.01f)) {
++            if(!geometry_edge_group_ok(cur,old,edges,i,end,0.01f)) {
+                 for(unsigned j=i;j<end;j++)held[edges[j].face]=1;
+             }
+         }
+@@ -274,8 +299,7 @@ static inline unsigned geometry_weld(const saturn_vk_vdp1_op *cur,unsigned n,sat
+         while(end<nh&&!geometry_edge_compare(&history[i],&history[end]))end++;
+         if(end>i+1) {
+             for(unsigned j=i+1;j<end;j++)geometry_join(parent,history[i].face,history[j].face);
+-            if(end!=i+2 || history[i].face==history[i+1].face ||
+-               !geometry_edge_close(cur,&history[i],&history[i+1],1.01f)) {
++            if(!geometry_edge_group_ok(old,cur,history,i,end,1.01f)) {
+                 for(unsigned j=i;j<end;j++)held[history[j].face]=1;
+             }
+         }
+--- a/tests/geometry_interp.c
++++ b/tests/geometry_interp.c
+@@ -118,6 +118,15 @@ static int component_safety(void) {
+     CHECK(geometry_interpolate(p,4,c,4,0,o)==4);geometry_weld(c,4,o);
+     for(unsigned i=0;i<3;i++)CHECK(!memcmp(&o[i],&c[i],sizeof o[i]));
+     CHECK((o[3].flip&SATURN_GEOMETRY_FLOAT)&&geometry_xy(&o[3],0)==98);
++
++    /* Three distinct faces on one edge (Baroque: wall panels above and below
++     * a ceiling trim) move together when every history agrees on the edge. */
++    c[0]=quad(0,1);c[1]=quad(0,2);c[2]=quad(0,3);
++    for(unsigned k=1;k<8;k+=2)c[1].xy[k]+=10;
++    {const int32_t trim[8]={-2,5,12,5,10,10,0,10};memcpy(c[2].xy,trim,sizeof trim);}
++    for(unsigned i=0;i<3;i++){p[i]=c[i];for(unsigned k=0;k<8;k+=2)p[i].xy[k]-=2;}
++    CHECK(geometry_interpolate(p,3,c,3,0,o)==3);geometry_weld(c,3,o);
++    for(unsigned i=0;i<3;i++)CHECK((o[i].flip&SATURN_GEOMETRY_FLOAT)&&geometry_xy(&o[i],2)==c[i].xy[2]-2);
+     return 0;
+ }
+ 
