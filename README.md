@@ -31,8 +31,8 @@ launcher, and settings that make it pleasant to play on a laptop.
 ## What you need
 
 - Windows 10 or 11, 64-bit, with a Vulkan-capable GPU (any recent Intel, AMD or NVIDIA).
-- **Baroque (Japan), product T-33901G**, as a CUE/BIN disc image dumped from your
-  own disc. The original Japanese release and the English fan translation
+- **Baroque (Japan), product T-33901G**, as a CUE/BIN disc image or a `.chd`,
+  dumped from your own disc. The original Japanese release and the English fan translation
   (tested: v1.0.1) both identify as T-33901G.
 - **A Sega Saturn BIOS** dumped from your own console (512 KB). A Japanese BIOS is
   recommended for this Japanese disc. The kit author used JP v1.01.
@@ -46,12 +46,13 @@ launcher, and settings that make it pleasant to play on a laptop.
 
 On first launch a setup window opens:
 
-1. It asks for your Saturn BIOS, then your Baroque `.cue` file, and checks both.
+1. It asks for your Saturn BIOS, then your Baroque `.cue` (or `.chd`) file, and checks both.
    It reads the disc's header to confirm it is Baroque, T-33901G.
 2. It downloads a portable copy of MSYS2 (the GCC compiler, about 1 GB, kept in
    `tools\` in the data folder). The download is verified by checksum.
 3. It downloads SaturnRecomp at a fixed commit (`26c9715`), applies this kit's
-   patches, and builds the runtime. That takes about 5 to 10 minutes.
+   patches, and builds the runtime. That takes about 5 to 10 minutes. It also
+   fetches libchdr (about 1 MB, checked file by file) so a `.chd` can be read directly.
 4. The game starts. Later launches start straight away.
 
 To choose a different disc or BIOS, run `Baroque.exe --setup`. To rebuild the
@@ -151,6 +152,10 @@ are in `kit\patches` and were offered back to the author in
 - **Upscaling in the dungeon.** Baroque clears the screen there with a full-screen
   polygon instead of the VDP1 erase, so upscaling, texture filtering and FXAA
   fell back to the native picture. A full-screen opaque polygon now counts as a clear.
+- **`.chd` disc images** (`0003-chd-disc-support.patch`). The disc layer reads a MAME CD
+  `.chd` through [libchdr](https://github.com/rtissera/libchdr) (BSD-3-Clause, pinned in
+  `kit\libchdr.sha256`) as if it were one BIN, so `.cue`/`.bin` and `.iso` behave exactly as
+  before. Only raw 2352-byte CD images are supported, which is what Saturn CHDs are.
 - **Action Replay code support** (`cheats.txt`).
 - Two small diagnostics improvements.
 
@@ -215,10 +220,23 @@ will ask for it again after an update.
 
 - **Setup failed:** `setup.log` in the data folder has the details. Run
   `Baroque.exe` again to retry; finished steps are skipped.
-- **"Not Baroque (T-33901G)":** choose the `.cue` of the Japanese disc, and keep
-  every `.bin` it lists next to it.
+- **"Not Baroque (T-33901G)":** choose the `.cue` (or `.chd`) of the Japanese disc, and keep
+  every `.bin` a `.cue` lists next to it.
+- **"That CHD is not a Sega Saturn disc image":** the `.chd` is not a raw Saturn CD
+  (a DVD or PS2 image, say). Use a CD `.chd` or the `.cue`.
 - **The game stopped with an error:** see `game\runtime.log` in the data folder.
 - **Slowdown:** lower the internal resolution in F1 (3x is smooth on Intel Iris Xe), close other heavy programs, and on a laptop, plug in.
+
+## RecompLauncher
+
+`recomplauncher.json` and `prepare-baroque.cmd` let RecompLauncher ask for the disc (`.cue`,
+`.chd` or `.iso`) and the BIOS on its setup screen, run setup without windows, and start
+the game. They call the same `kit\setup.ps1` as `Baroque.exe`.
+
+The launcher's game page also shows the options from `settings.ini`: window mode, internal
+resolution (1x to 8x), texture filtering, FXAA, model smoothing, widescreen, frame interpolation,
+volume, mute and the audio buffer. It edits the same file F1 does, in the data folder (or beside
+`Baroque.exe` with `portable.txt`), so both always agree.
 
 ## Legal
 
