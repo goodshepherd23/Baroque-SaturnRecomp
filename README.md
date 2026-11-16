@@ -129,6 +129,8 @@ name to `+` to turn it on. The file is re-read while the game runs. Included, al
 
 - Infinite HP, Infinite VT (checked against the game's memory)
 - Faster level ups / max EXP, Max status (from almarsguides.com)
+- Faster camera turning (2x). Baroque turns in 90-degree steps; this doubles how
+  fast each step plays, and the view still stops square to the corridors.
 
 You can paste in other Saturn Action Replay codes. Types `1` (16-bit write),
 `3` (8-bit write) and `D` (16-bit compare) are supported. Master codes (`F`/`B`)

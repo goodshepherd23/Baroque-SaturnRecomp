@@ -36,3 +36,10 @@ B6002800 0000
 16098D5A 03E7
 16098D5C 03E7
 16098D5E 03E7
+
+# Turns the camera twice as fast (the game turns in 90-degree steps; the
+# view still stops square to the corridors). Only changes the turn rate while
+# the game is turning, so it never starts a turn by itself. Checked against this disc.
+- Faster camera turning (2x)
+D603878E 0093
+1603878E 0126
