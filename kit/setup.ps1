@@ -145,10 +145,14 @@ Step 'Your Baroque disc'
 $toml = "$game\game.toml"
 if (-not $Disc -and (Test-Path -LiteralPath $toml)) {
     $m = Select-String -LiteralPath $toml -Pattern '^disc\s*=\s*"(.+)"'
-    if ($m) { $existing = $m.Matches[0].Groups[1].Value -replace '/', '\'; if (Test-Path -LiteralPath $existing) { $Disc = $existing } }
+    if ($m) {
+        $existing = $m.Matches[0].Groups[1].Value -replace '/', '\'
+        if (-not [IO.Path]::IsPathRooted($existing)) { $existing = Join-Path $game $existing }   # relative to game.toml
+        if (Test-Path -LiteralPath $existing) { $Disc = (Resolve-Path -LiteralPath $existing).Path }
+    }
 }
-if (-not $Disc) {
-    $local = Get-ChildItem -LiteralPath "$Root\disc", "$Data\disc" -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.cue', '.chd' } | Select-Object -First 1
+if (-not $Disc) {   # a disc\ folder, or the disc right beside Baroque.exe
+    $local = Get-ChildItem -LiteralPath "$Root\disc", "$Data\disc", $Root -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.cue', '.chd' } | Select-Object -First 1
     if ($local) { $Disc = $local.FullName }
 }
 if (-not $Disc) {
@@ -161,7 +165,14 @@ try {
     if ($isChd) { if (-not (Test-ChdMagic $Disc)) { throw 'That file is not a CHD disc image.' } }
     else { Test-BaroqueCue $Disc }
 } catch { Fail $_.Exception.Message }
-$discToml = (Resolve-Path -LiteralPath $Disc).Path -replace '\\', '/'
+$discFull = (Resolve-Path -LiteralPath $Disc).Path
+# A disc inside the data folder (in portable mode, the app folder) is written relative
+# to game.toml, so the folder keeps working when it is moved or used under Wine.
+if ($discFull.StartsWith("$Data\", [StringComparison]::OrdinalIgnoreCase)) {
+    $discToml = '../' + ($discFull.Substring($Data.Length + 1) -replace '\\', '/')
+} else {
+    $discToml = $discFull -replace '\\', '/'
+}
 [IO.File]::WriteAllText($toml, (Get-Content -LiteralPath "$kit\game\game.toml.in" -Raw).Replace('@DISC@', $discToml),
     (New-Object Text.UTF8Encoding($false)))
 Write-Host "Disc: $Disc"

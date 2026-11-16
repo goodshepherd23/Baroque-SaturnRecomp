@@ -58,6 +58,15 @@ On first launch a setup window opens:
 To choose a different disc or BIOS, run `Baroque.exe --setup`. To rebuild the
 runtime, run `Baroque.exe --rebuild`.
 
+Setup skips the disc question when it finds a `.cue` or `.chd` in a `disc` folder
+(next to `Baroque.exe` or in the data folder) or right next to `Baroque.exe`.
+
+**Linux (Wine or Proton):** setup needs Windows PowerShell, which Wine does not
+provide, so run the first setup on Windows in portable mode (see below) with the
+disc in the app folder's `disc` folder. Setup then records the disc path relative
+to the game, so the whole folder can be copied to Linux and started there with
+`wine Baroque.exe`. This is not tested by the author.
+
 ## Controls
 
 | Saturn | Keyboard | Xbox-style controller |

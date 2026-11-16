@@ -1,0 +1,45 @@
+Keep periodic interpolation diagnostics out of normal play.
+
+[interp]/[interp-clear] (every 300 fields whenever upscaling or interpolation
+is on) and [interp-timing] (every 600 presentations) were written to stderr
+unconditionally. stderr is unbuffered, so each line is a synchronous file
+write from the render thread: about 0.7 ms on this PC but over 10 ms at
+times, enough to make a field late and drop audio every 5 seconds. They
+are now written only with SATURN_INTERP_LOG set.
+
+--- a/runner/src/vulkan_renderer.c
++++ b/runner/src/vulkan_renderer.c
+@@ -937,8 +937,12 @@ int saturn_vk_interpolation_begin(saturn_vk_renderer *r,saturn *s,int w,int h,ch
+     }
+     r->geometry_age=(unsigned)(s->frames-r->geometry_stamp);
+     r->history_count=n;r->history_valid=safe;r->history_width=w;r->history_height=h;
+-    if(s->frames%300==0)fprintf(stderr,"[interp] field %llu geometry %u matched %u safe %d span %u age %u\n",(unsigned long long)s->frames,n,r->matched,safe,r->geometry_span,r->geometry_age);
+-    if(s->frames%300==0 && n)fprintf(stderr,"[interp-clear] %u %d %d %d %d\n",cur[0].kind,cur[0].xy[0],cur[0].xy[1],cur[0].xy[2],cur[0].xy[3]);
++    /* Diagnostics only: an unbuffered stderr write from the render thread can
++     * cost several milliseconds on a slow log file, a hitch every 5 seconds. */
++    static int interp_log=-1;
++    if(interp_log<0)interp_log=getenv("SATURN_INTERP_LOG")!=NULL;
++    if(interp_log && s->frames%300==0)fprintf(stderr,"[interp] field %llu geometry %u matched %u safe %d span %u age %u\n",(unsigned long long)s->frames,n,r->matched,safe,r->geometry_span,r->geometry_age);
++    if(interp_log && s->frames%300==0 && n)fprintf(stderr,"[interp-clear] %u %d %d %d %d\n",cur[0].kind,cur[0].xy[0],cur[0].xy[1],cur[0].xy[2],cur[0].xy[3]);
+     return 1;
+ }
+ int saturn_vk_interpolation_render(saturn_vk_renderer *r,saturn *s,float alpha,int w,int h,char *error,size_t size) {
+--- a/runner/src/window.c
++++ b/runner/src/window.c
+@@ -1216,9 +1216,13 @@ int main(int argc, char **argv)
+                         interpolation_intervals[interpolation_samples++]=1000.0*(double)(now-interpolation_last)/perf_freq;
+                     interpolation_last=now;
+                     if(interpolation_samples==600) {
+-                        qsort(interpolation_intervals,600,sizeof(double),compare_double);
+-                        fprintf(stderr,"[interp-timing] p50 %.3f p95 %.3f p99 %.3f worst %.3f ms\n",
+-                            interpolation_intervals[300],interpolation_intervals[570],interpolation_intervals[594],interpolation_intervals[599]);
++                        /* Diagnostics only (SATURN_INTERP_LOG): a periodic log
++                         * write on this thread can hitch a presentation. */
++                        if(getenv("SATURN_INTERP_LOG")) {
++                            qsort(interpolation_intervals,600,sizeof(double),compare_double);
++                            fprintf(stderr,"[interp-timing] p50 %.3f p95 %.3f p99 %.3f worst %.3f ms\n",
++                                interpolation_intervals[300],interpolation_intervals[570],interpolation_intervals[594],interpolation_intervals[599]);
++                        }
+                         interpolation_samples=0;
+                     }
+                     presentation_deadline=saturn_next_field_deadline(presentation_deadline,now,
