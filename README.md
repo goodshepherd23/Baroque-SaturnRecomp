@@ -99,9 +99,10 @@ between, so walking and turning look smooth at 60 Hz or more. Menus, text and
 the HUD still update at the game's own rate.
 
 Before v0.1.6 this setting did almost nothing in the dungeon: it repeated each
-game frame, which only made camera motion look blurrier. When a wall or object
-comes into or leaves view, that part of the picture holds still for one game
-frame rather than risk a torn seam.
+game frame, which only made camera motion look blurrier. Before v0.1.7 turning
+still froze between the four compass directions; turning is now interpolated
+too. If something cannot be paired up safely, that part of the picture holds
+still for one game frame rather than risk a torn seam.
 
 ## Widescreen
 
@@ -168,6 +169,11 @@ are in `kit\patches` and were offered back to the author in
   when their colour-table address matched, but Baroque swaps lighting tables every
   frame, and an edge shared by three faces froze the whole room. Both are fixed
   (`0004-dungeon-interpolation.patch`).
+- **Frame interpolation while turning.** A turn moves the view about one wall-tile
+  width per game frame, so identical tiles were paired with their neighbours and new
+  faces at the screen edge froze the room. The camera shift is now detected from the
+  whole picture and used to pair faces, and new faces get a history from their
+  neighbours (`0005-turn-interpolation.patch`).
 - **`.chd` disc images** (`0003-chd-disc-support.patch`). The disc layer reads a MAME CD
   `.chd` through [libchdr](https://github.com/rtissera/libchdr) (BSD-3-Clause, pinned in
   `kit\libchdr.sha256`) as if it were one BIN, so `.cue`/`.bin` and `.iso` behave exactly as

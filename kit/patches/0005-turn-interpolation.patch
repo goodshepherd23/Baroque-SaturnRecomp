@@ -1,0 +1,451 @@
+Frame interpolation while the camera turns (issue #8).
+
+A turn moves Baroque's view about one wall-tile width per game frame, so
+the nearest identical tile is the neighbour (the room seemed not to move),
+new faces entering at the screen edge had no history, and corners rounded
+a pixel apart froze the room in geometry_weld. Under a detected camera
+shift (voted from every face) the matcher predicts positions, follows shared
+edges between faces, gives entering faces a history from their neighbours,
+and lets corners within a pixel share one motion. Every face still has to
+pass geometry_pair_valid and the weld. Without a detected shift (standing
+still, walking forward) matching is unchanged.
+
+tests/geometry_interp.c: camera_turn test; the reference comparison skips
+scenes that are detected as turns.
+
+--- a/runner/include/geometry_interp.h
++++ b/runner/include/geometry_interp.h
+@@ -135,9 +135,314 @@ static inline int geometry_choice_index(const geometry_choice *c) {
+        (c->second!=INT64_MAX && c->first*4>=c->second*3))return -1;
+     return c->best;
+ }
++/* Distance between two faces after moving the previous one by (mx,my). */
++static inline int64_t geometry_distance_by(const saturn_vk_vdp1_op *a,const saturn_vk_vdp1_op *b,int32_t mx,int32_t my) {
++    int64_t d=0;
++    for(int k=0;k<8;k++){int64_t x=(int64_t)a->xy[k]-b->xy[k]-(k&1?my:mx);d+=x*x;}
++    return d;
++}
++typedef struct {int32_t x,y,sx,sy;unsigned face;} geometry_vote;
++static inline int geometry_vote_compare(const void *aa,const void *bb) {
++    const geometry_vote *a=aa,*b=bb;
++    if(a->x!=b->x)return a->x<b->x?-1:1;
++    if(a->y!=b->y)return a->y<b->y?-1:1;
++    return a->face<b->face?-1:a->face>b->face;
++}
++static inline int geometry_i32_compare(const void *a,const void *b) {
++    int32_t x=*(const int32_t*)a,y=*(const int32_t*)b;return x<y?-1:x>y;
++}
++/* Camera turns move the whole picture by about one screen offset, and in
++ * Baroque that offset is close to the width of a repeated wall tile, so the
++ * nearest identical face is the neighbouring tile and nothing seems to move.
++ * Each current face votes for every centroid offset that lines it up with an
++ * identical previous face. Votes are binned at 4 pixels and each bin is scored
++ * with its neighbours, since perspective spreads a turn over a few pixels. The
++ * true offset collects most faces; an alias one tile away loses the faces at
++ * the ends of each row and every face with a unique texture. The offset is the
++ * median vote inside the winning window, and it is only used when it clearly
++ * beats standing still, so still and forward-moving pictures keep the plain
++ * nearest match. */
++static inline void geometry_vote_shift(const saturn_vk_vdp1_op *prev,const saturn_vk_vdp1_op *cur,unsigned cn,
++    const int *head,const int *next,unsigned buckets,int32_t *mx,int32_t *my) {
++    *mx=*my=0;
++    unsigned cap=cn*16u,count=0,eligible=0,bins=0;
++    geometry_vote *v=malloc((size_t)cap*sizeof *v);
++    unsigned *start=malloc(((size_t)cap+1)*sizeof *start),*faces=malloc((size_t)cap*sizeof *faces);
++    int32_t *ax=malloc((size_t)cap*sizeof *ax),*ay=malloc((size_t)cap*sizeof *ay);
++    if(!v||!start||!faces||!ax||!ay)goto done;
++    for(unsigned i=0;i<cn;i++) {
++        if(!geometry_eligible(&cur[i]))continue;
++        eligible++;
++        unsigned key=geometry_material_key(&cur[i])&(buckets-1);
++        for(int j=head[key];j>=0 && count<cap;j=next[j])if(geometry_same(&cur[i],&prev[j])) {
++            int32_t sx=0,sy=0;   /* four times the centroid offset */
++            for(unsigned k=0;k<4;k++){sx+=cur[i].xy[k*2]-prev[j].xy[k*2];sy+=cur[i].xy[k*2+1]-prev[j].xy[k*2+1];}
++            v[count++]=(geometry_vote){(sx>=0?sx+8:sx-8)/16,(sy>=0?sy+8:sy-8)/16,sx,sy,i};
++        }
++    }
++    qsort(v,count,sizeof *v,geometry_vote_compare);
++    for(unsigned a=0;a<count;) {   /* bins with their distinct face counts */
++        unsigned b=a,n=0;
++        while(b<count && v[b].x==v[a].x && v[b].y==v[a].y){if(b==a||v[b].face!=v[b-1].face)n++;b++;}
++        start[bins]=a;faces[bins]=n;bins++;a=b;
++    }
++    start[bins]=count;
++    unsigned best=0,zero=0;int bi=-1;
++    for(unsigned a=0;a<bins;a++) {
++        unsigned score=0;
++        for(unsigned b=0;b<bins;b++) {
++            int32_t dx=v[start[b]].x-v[start[a]].x,dy=v[start[b]].y-v[start[a]].y;
++            if(dx>=-1&&dx<=1&&dy>=-1&&dy<=1)score+=faces[b];
++        }
++        if(!v[start[a]].x && !v[start[a]].y)zero=score;
++        if(score>best){best=score;bi=(int)a;}
++    }
++    if(bi<0 || (!v[start[bi]].x && !v[start[bi]].y) || best<8 || best*4<eligible || best<=zero+zero/4)goto done;
++    unsigned n=0;
++    for(unsigned b=0;b<bins;b++) {
++        int32_t dx=v[start[b]].x-v[start[bi]].x,dy=v[start[b]].y-v[start[bi]].y;
++        if(dx<-1||dx>1||dy<-1||dy>1)continue;
++        for(unsigned e=start[b];e<start[b+1];e++){ax[n]=v[e].sx;ay[n]=v[e].sy;n++;}
++    }
++    qsort(ax,n,sizeof *ax,geometry_i32_compare);qsort(ay,n,sizeof *ay,geometry_i32_compare);
++    *mx=(ax[n/2]>=0?ax[n/2]+2:ax[n/2]-2)/4;*my=(ay[n/2]>=0?ay[n/2]+2:ay[n/2]-2)/4;
++done:
++    free(v);free(start);free(faces);free(ax);free(ay);
++}
++/* Faces that share an edge stay neighbours across that same edge however the
++ * camera moves, while identical repeated tiles only resemble each other. From
++ * every matched face, the unmatched face across its edge k is paired with the
++ * one face across the matched partner's edge k that has the same identity and
++ * shares it through the same edge index. A wrong guess here only produces edges
++ * whose histories disagree, which the weld already holds. */
++typedef struct {int32_t xy[4];unsigned face,edge;} geometry_link;
++static inline int geometry_link_compare(const void *aa,const void *bb) {
++    const geometry_link *a=aa,*b=bb;
++    for(unsigned k=0;k<4;k++)if(a->xy[k]!=b->xy[k])return a->xy[k]<b->xy[k]?-1:1;
++    return 0;
++}
++static inline unsigned geometry_links(const saturn_vk_vdp1_op *ops,unsigned n,geometry_link *links,unsigned *slot) {
++    unsigned count=0;
++    for(unsigned i=0;i<n*4;i++)slot[i]=UINT32_MAX;
++    for(unsigned i=0;i<n;i++)if(geometry_eligible(&ops[i]))for(unsigned k=0;k<4;k++) {
++        unsigned j=(k+1)&3u;
++        int32_t ax=ops[i].xy[k*2],ay=ops[i].xy[k*2+1],bx=ops[i].xy[j*2],by=ops[i].xy[j*2+1];
++        if(ax==bx&&ay==by)continue;
++        if(ax>bx||(ax==bx&&ay>by)){int32_t t=ax;ax=bx;bx=t;t=ay;ay=by;by=t;}
++        links[count++]=(geometry_link){{ax,ay,bx,by},i,k};
++    }
++    qsort(links,count,sizeof *links,geometry_link_compare);
++    for(unsigned i=0;i<count;i++)slot[links[i].face*4+links[i].edge]=i;
++    return count;
++}
++static inline unsigned geometry_propagate(const saturn_vk_vdp1_op *prev,unsigned pn,
++    const saturn_vk_vdp1_op *cur,unsigned cn,int *match) {
++    unsigned added=0;
++    geometry_link *pl=malloc((size_t)pn*4*sizeof *pl),*cl=malloc((size_t)cn*4*sizeof *cl);
++    unsigned *ps=malloc((size_t)pn*4*sizeof *ps),*cs=malloc((size_t)cn*4*sizeof *cs);
++    unsigned *queue=malloc(cn*sizeof *queue);
++    uint8_t *used=calloc(pn,1);
++    if(pl && cl && ps && cs && queue && used) {
++        unsigned np=geometry_links(prev,pn,pl,ps),nc=geometry_links(cur,cn,cl,cs),qh=0,qt=0;
++        for(unsigned i=0;i<cn;i++)if(match[i]>=0){used[match[i]]=1;queue[qt++]=i;}
++        while(qh<qt) {
++            unsigned a=queue[qh++],ap=(unsigned)match[a];
++            for(unsigned k=0;k<4;k++) {
++                unsigned c0=cs[a*4+k],p0=ps[ap*4+k];
++                if(c0==UINT32_MAX||p0==UINT32_MAX)continue;
++                unsigned cb=c0,pb=p0;
++                while(cb>0 && !geometry_link_compare(&cl[cb-1],&cl[c0]))cb--;
++                while(pb>0 && !geometry_link_compare(&pl[pb-1],&pl[p0]))pb--;
++                for(unsigned c=cb;c<nc && !geometry_link_compare(&cl[c],&cl[c0]);c++) {
++                    unsigned b=cl[c].face;
++                    if(b==a || match[b]>=0)continue;
++                    int found=-1,count=0;
++                    for(unsigned q=pb;q<np && !geometry_link_compare(&pl[q],&pl[p0]);q++) {
++                        unsigned bp=pl[q].face;
++                        if(bp==ap || used[bp] || pl[q].edge!=cl[c].edge)continue;
++                        if(!geometry_same(&cur[b],&prev[bp]) || !geometry_pair_valid(&prev[bp],&cur[b]))continue;
++                        found=(int)bp;count++;
++                    }
++                    if(count!=1)continue;
++                    match[b]=found;used[found]=1;queue[qt++]=b;added++;
++                }
++            }
++        }
++    }
++    free(pl);free(cl);free(ps);free(cs);free(queue);free(used);
++    return added;
++}
++/* While the camera turns, three things hold a whole room still that are not
++ * real problems: faces that just entered at the screen edge (no history),
++ * near faces the game re-cuts every frame (no history), and corners where
++ * matched faces meet exactly now but were rounded 1 pixel apart last frame
++ * (contradictory history). Under a detected camera shift, every current
++ * corner gets one previous position. Matched faces that meet at a corner and
++ * agree within a pixel share the average of their previous positions. Faces
++ * without a match are filled in from the matched ones outward: a corner that
++ * already has a previous position keeps it, so seams stay closed, and the
++ * other corners move by the mean motion of the known ones, or by the camera
++ * shift when none are known. Every face must still pass geometry_pair_valid
++ * with its final history; anything else keeps its current geometry and the
++ * weld holds it as before. Returns the number of faces given a history. */
++typedef struct {int32_t x,y;float sx,sy,lx,ly,hx,hy,ox,oy;unsigned n;uint8_t state;} geometry_vertex;
++enum {GEOMETRY_VERTEX_FREE,GEOMETRY_VERTEX_KNOWN,GEOMETRY_VERTEX_CONFLICT};
++static inline geometry_vertex *geometry_vertex_slot(geometry_vertex *t,unsigned mask,int32_t x,int32_t y) {
++    uint32_t h=((uint32_t)x*73856093u)^((uint32_t)y*19349663u);
++    for(unsigned i=h&mask;;i=(i+1)&mask)if(!t[i].n&&!t[i].state)return &t[i];
++    else if(t[i].x==x&&t[i].y==y)return &t[i];
++}
++static inline int geometry_history_apply(const saturn_vk_vdp1_op *cur,const float *ox,const float *oy,
++    float alpha,saturn_vk_vdp1_op *out) {
++    saturn_vk_vdp1_op h=*cur;
++    for(unsigned k=0;k<4;k++){memcpy(&h.xy[k*2],&ox[k],4);memcpy(&h.xy[k*2+1],&oy[k],4);}
++    h.flip|=SATURN_GEOMETRY_FLOAT;
++    if(!geometry_pair_valid(&h,cur))return 0;
++    *out=*cur;
++    for(unsigned k=0;k<4;k++) {
++        float x=ox[k]+((float)cur->xy[k*2]-ox[k])*alpha,y=oy[k]+((float)cur->xy[k*2+1]-oy[k])*alpha;
++        memcpy(&out->xy[k*2],&x,4);memcpy(&out->xy[k*2+1],&y,4);
++    }
++    out->flip|=SATURN_GEOMETRY_FLOAT;
++    return 1;
++}
++static inline unsigned geometry_synthesize(const saturn_vk_vdp1_op *prev,const saturn_vk_vdp1_op *cur,
++    unsigned cn,const int *match,int32_t mx,int32_t my,float alpha,saturn_vk_vdp1_op *out) {
++    unsigned size=1,given=0;
++    while(size<cn*8u+16u)size<<=1;
++    geometry_vertex *t=calloc(size,sizeof *t);
++    uint8_t *done=calloc(cn,1);
++    if(!t||!done){free(t);free(done);return 0;}
++    /* Gather every matched face's previous corner positions. */
++    for(unsigned i=0;i<cn;i++)if(match[i]>=0)for(unsigned k=0;k<4;k++) {
++        geometry_vertex *v=geometry_vertex_slot(t,size-1,cur[i].xy[k*2],cur[i].xy[k*2+1]);
++        float ox=(float)prev[match[i]].xy[k*2],oy=(float)prev[match[i]].xy[k*2+1];
++        if(!v->n){v->x=cur[i].xy[k*2];v->y=cur[i].xy[k*2+1];v->lx=v->hx=ox;v->ly=v->hy=oy;}
++        v->sx+=ox;v->sy+=oy;v->n++;
++        v->lx=fminf(v->lx,ox);v->hx=fmaxf(v->hx,ox);
++        v->ly=fminf(v->ly,oy);v->hy=fmaxf(v->hy,oy);
++    }
++    for(unsigned i=0;i<size;i++)if(t[i].n) {
++        if(t[i].hx-t[i].lx<=1.01f && t[i].hy-t[i].ly<=1.01f) {
++            t[i].ox=t[i].sx/(float)t[i].n;t[i].oy=t[i].sy/(float)t[i].n;t[i].state=GEOMETRY_VERTEX_KNOWN;
++        } else t[i].state=GEOMETRY_VERTEX_CONFLICT;
++    }
++    /* The Saturn rounds every corner on its own, so faces that meet within a
++     * pixel now may have been two pixels apart last frame. Known corners within
++     * a pixel of each other form one group that moves together: each takes the
++     * group's mean motion, so their previous offsets equal their current ones.
++     * A group whose motions differ by more than 3 pixels is a real contradiction
++     * and is left for the weld. */
++    {
++        unsigned *parent=malloc(size*sizeof *parent);
++        float *gx=calloc(size,sizeof *gx),*gy=calloc(size,sizeof *gy),*lo=malloc(size*2*sizeof *lo),*hi=malloc(size*2*sizeof *hi);
++        unsigned *gn=calloc(size,sizeof *gn);
++        if(parent&&gx&&gy&&lo&&hi&&gn) {
++            for(unsigned i=0;i<size;i++)parent[i]=i;
++            for(unsigned i=0;i<size;i++)if(t[i].state==GEOMETRY_VERTEX_KNOWN)
++                for(int dy=-1;dy<=1;dy++)for(int dx=-1;dx<=1;dx++)if(dx||dy) {
++                    geometry_vertex *n=geometry_vertex_slot(t,size-1,t[i].x+dx,t[i].y+dy);
++                    if(n->state!=GEOMETRY_VERTEX_KNOWN)continue;
++                    unsigned a=i,b=(unsigned)(n-t);
++                    while(parent[a]!=a)a=parent[a]=parent[parent[a]];
++                    while(parent[b]!=b)b=parent[b]=parent[parent[b]];
++                    if(a!=b)parent[b]=a;
++                }
++            for(unsigned i=0;i<size;i++)if(t[i].state==GEOMETRY_VERTEX_KNOWN) {
++                unsigned r=i;while(parent[r]!=r)r=parent[r];
++                float mx0=(float)t[i].x-t[i].ox,my0=(float)t[i].y-t[i].oy;
++                if(!gn[r]){lo[r*2]=hi[r*2]=mx0;lo[r*2+1]=hi[r*2+1]=my0;}
++                lo[r*2]=fminf(lo[r*2],mx0);hi[r*2]=fmaxf(hi[r*2],mx0);
++                lo[r*2+1]=fminf(lo[r*2+1],my0);hi[r*2+1]=fmaxf(hi[r*2+1],my0);
++                gx[r]+=mx0;gy[r]+=my0;gn[r]++;
++            }
++            for(unsigned i=0;i<size;i++)if(t[i].state==GEOMETRY_VERTEX_KNOWN) {
++                unsigned r=i;while(parent[r]!=r)r=parent[r];
++                if(gn[r]<2)continue;
++                if(hi[r*2]-lo[r*2]>3.01f||hi[r*2+1]-lo[r*2+1]>3.01f){t[i].state=GEOMETRY_VERTEX_CONFLICT;continue;}
++                t[i].ox=(float)t[i].x-gx[r]/(float)gn[r];t[i].oy=(float)t[i].y-gy[r]/(float)gn[r];
++            }
++        }
++        free(parent);free(gx);free(gy);free(lo);free(hi);free(gn);
++    }
++    /* Matched faces take the agreed corner positions. */
++    for(unsigned i=0;i<cn;i++)if(match[i]>=0) {
++        float ox[4],oy[4];int conflict=0;
++        for(unsigned k=0;k<4;k++) {
++            geometry_vertex *v=geometry_vertex_slot(t,size-1,cur[i].xy[k*2],cur[i].xy[k*2+1]);
++            if(v->state!=GEOMETRY_VERTEX_KNOWN){conflict=1;break;}
++            ox[k]=v->ox;oy[k]=v->oy;
++        }
++        done[i]=1;
++        if(!conflict && geometry_history_apply(&cur[i],ox,oy,alpha,&out[i]))given++;
++        else {   /* keep the face's own pairing; the weld decides */
++            const saturn_vk_vdp1_op *p=&prev[match[i]];
++            for(unsigned k=0;k<4;k++){ox[k]=(float)p->xy[k*2];oy[k]=(float)p->xy[k*2+1];}
++            if(geometry_history_apply(&cur[i],ox,oy,alpha,&out[i]))given++;
++        }
++    }
++    /* Unmatched faces, from the matched ones outward. */
++    for(int pass=0;pass<2;pass++)for(int progress=1;progress;) {
++        progress=0;
++        for(unsigned i=0;i<cn;i++) {
++            if(done[i]||!geometry_eligible(&cur[i]))continue;
++            float sx=0,sy=0,ox[4],oy[4];unsigned known=0,bad=0;
++            for(unsigned k=0;k<4;k++) {
++                geometry_vertex *v=geometry_vertex_slot(t,size-1,cur[i].xy[k*2],cur[i].xy[k*2+1]);
++                if(v->state==GEOMETRY_VERTEX_CONFLICT)bad=1;
++                else if(v->state==GEOMETRY_VERTEX_KNOWN){sx+=cur[i].xy[k*2]-v->ox;sy+=cur[i].xy[k*2+1]-v->oy;known++;}
++            }
++            if(bad||(!known&&!pass))continue;
++            float dx=known?sx/known:(float)mx,dy=known?sy/known:(float)my;
++            for(unsigned k=0;k<4;k++) {
++                int32_t x=cur[i].xy[k*2],y=cur[i].xy[k*2+1];
++                geometry_vertex *v=geometry_vertex_slot(t,size-1,x,y);
++                float ex=dx,ey=dy;
++                if(v->state!=GEOMETRY_VERTEX_KNOWN)   /* a known corner within a pixel sets the motion */
++                    for(int ny=-1;ny<=1;ny++)for(int nx=-1;nx<=1;nx++) {
++                        geometry_vertex *n=geometry_vertex_slot(t,size-1,x+nx,y+ny);
++                        if(n->state==GEOMETRY_VERTEX_KNOWN){ex=(float)n->x-n->ox;ey=(float)n->y-n->oy;}
++                    }
++                ox[k]=v->state==GEOMETRY_VERTEX_KNOWN?v->ox:(float)x-ex;
++                oy[k]=v->state==GEOMETRY_VERTEX_KNOWN?v->oy:(float)y-ey;
++            }
++            done[i]=1;progress=1;
++            if(!geometry_history_apply(&cur[i],ox,oy,alpha,&out[i]))continue;
++            given++;
++            for(unsigned k=0;k<4;k++) {
++                geometry_vertex *v=geometry_vertex_slot(t,size-1,cur[i].xy[k*2],cur[i].xy[k*2+1]);
++                if(v->state==GEOMETRY_VERTEX_FREE) {
++                    v->x=cur[i].xy[k*2];v->y=cur[i].xy[k*2+1];v->ox=ox[k];v->oy=oy[k];
++                    v->n=1;v->state=GEOMETRY_VERTEX_KNOWN;
++                }
++            }
++        }
++    }
++    free(t);free(done);return given;
++}
++/* The camera offset geometry_interpolate would use for these two pictures;
++ * (0,0) means plain nearest matching (still, forward motion, or no clear turn). */
++static inline void geometry_camera_shift(const saturn_vk_vdp1_op *prev,unsigned pn,
++    const saturn_vk_vdp1_op *cur,unsigned cn,int32_t *mx,int32_t *my) {
++    unsigned buckets=1;
++    *mx=*my=0;
++    if(!pn||!cn)return;
++    while(buckets<pn && buckets<16384)buckets<<=1;
++    int *head=malloc(buckets*sizeof *head),*next=malloc(pn*sizeof *next);
++    if(head && next) {
++        for(unsigned i=0;i<buckets;i++)head[i]=-1;
++        for(unsigned j=0;j<pn;j++)if(geometry_eligible(&prev[j])) {
++            unsigned key=geometry_material_key(&prev[j])&(buckets-1);
++            next[j]=head[key];head[key]=(int)j;
++        }
++        geometry_vote_shift(prev,cur,cn,head,next,buckets,mx,my);
++    }
++    free(head);free(next);
++}
+ static inline unsigned geometry_interpolate(const saturn_vk_vdp1_op *prev,unsigned pn,
+     const saturn_vk_vdp1_op *cur,unsigned cn,float alpha,saturn_vk_vdp1_op *out) {
+     unsigned matched=0,buckets=1;
++    int32_t mx=0,my=0;
+     memcpy(out,cur,cn*sizeof(*out));
+     if(!pn || !cn)return 0;
+     if(alpha<0)alpha=0;
+@@ -153,30 +458,52 @@ static inline unsigned geometry_interpolate(const saturn_vk_vdp1_op *prev,unsign
+             unsigned key=geometry_material_key(&prev[j])&(buckets-1);
+             next[j]=head[key];head[key]=(int)j;
+         }
++        geometry_vote_shift(prev,cur,cn,head,next,buckets,&mx,&my);
+         for(unsigned i=0;i<cn;i++) {
+             cc[i]=(geometry_choice){-1,INT64_MAX,INT64_MAX};
+             if(!geometry_eligible(&cur[i]))continue;
+             unsigned key=geometry_material_key(&cur[i])&(buckets-1);
+             for(int j=head[key];j>=0;j=next[j])if(geometry_same(&cur[i],&prev[j])) {
+-                int64_t d=geometry_distance(&cur[i],&prev[j]);
++                int64_t d=geometry_distance_by(&cur[i],&prev[j],mx,my);
++                /* Under a detected turn a true partner sits near the predicted
++                 * position (perspective adds a few pixels); an identical tile
++                 * one width away is an alias, not a closer guess. */
++                if((mx||my) && d>8*16*16)continue;
+                 geometry_consider(&cc[i],j,d);geometry_consider(&pc[j],(int)i,d);
+             }
+         }
+     }
++    int *match=malloc(cn*sizeof *match);
+     for(unsigned i=0;i<cn;i++) {
++        if(match)match[i]=-1;
+         int j=head&&next&&pc&&cc?geometry_choice_index(&cc[i]):geometry_nearest(&cur[i],prev,pn);
+         if(j<0)continue;
+         int reverse=head&&next&&pc&&cc?geometry_choice_index(&pc[j]):geometry_nearest(&prev[j],cur,cn);
+         if(reverse!=(int)i)continue;
+         if(!geometry_pair_valid(&prev[j],&cur[i]))continue;
++        if(match)match[i]=j;
++        else {
++            matched++;
++            for(int k=0;k<8;k++) {
++                float v=prev[j].xy[k]+((float)cur[i].xy[k]-prev[j].xy[k])*alpha;
++                memcpy(&out[i].xy[k],&v,4);
++            }
++            out[i].flip|=SATURN_GEOMETRY_FLOAT;
++        }
++    }
++    if(match && (mx||my)) {
++        geometry_propagate(prev,pn,cur,cn,match);
++        matched=geometry_synthesize(prev,cur,cn,match,mx,my,alpha,out);
++    } else if(match)for(unsigned i=0;i<cn;i++)if(match[i]>=0) {
++        const saturn_vk_vdp1_op *p=&prev[match[i]];
+         matched++;
+         for(int k=0;k<8;k++) {
+-            float v=prev[j].xy[k]+((float)cur[i].xy[k]-prev[j].xy[k])*alpha;
++            float v=p->xy[k]+((float)cur[i].xy[k]-p->xy[k])*alpha;
+             memcpy(&out[i].xy[k],&v,4);
+         }
+         out[i].flip|=SATURN_GEOMETRY_FLOAT;
+     }
+-    free(head);free(next);free(pc);free(cc);return matched;
++    free(match);free(head);free(next);free(pc);free(cc);return matched;
+ }
+ /* Current and previous shared edges define a connected surface. A missing or
+  * contradictory face history holds that entire component at its current
+--- a/tests/geometry_interp.c
++++ b/tests/geometry_interp.c
+@@ -30,6 +30,7 @@ static unsigned rng_state=17;
+ static unsigned random_word(void){rng_state=rng_state*1664525u+1013904223u;return rng_state;}
+ static int matching_equivalence(void) {
+     saturn_vk_vdp1_op p[128],c[128],a[128],b[128];
++    unsigned turning=0;
+     for(unsigned trial=0;trial<1000;trial++) {
+         unsigned pn=random_word()%128+1,cn=random_word()%128+1;
+         for(unsigned i=0;i<pn;i++) {
+@@ -43,13 +44,43 @@ static int matching_equivalence(void) {
+             if(!(i%9))c[i].colr^=1;
+         }
+         float alpha=(trial%5)*0.25f;
++        /* A detected camera turn switches to shift-predicted matching, which
++         * the plain reference does not model; turning has its own test. */
++        int32_t sx,sy;geometry_camera_shift(p,pn,c,cn,&sx,&sy);
++        if(sx||sy){turning++;continue;}
+         unsigned na=geometry_interpolate_reference(p,pn,c,cn,alpha,a);
+         unsigned nb=geometry_interpolate(p,pn,c,cn,alpha,b);
+         if(na!=nb||memcmp(a,b,cn*sizeof *a)){printf("matcher mismatch trial %u\n",trial);return 0;}
+     }
++    if(turning>50){printf("%u random scenes looked like camera turns\n",turning);return 0;}
+     return 1;
+ }
+ 
++/* A camera turn by exactly one tile width: every identical tile is also one
++ * tile from its neighbour's old place. A row of distinct faces below the
++ * tiles makes the true turn the clear winner, every face must move by the
++ * turn (not by zero, the alias), and a tile entering at the edge must get a
++ * history so the weld keeps the whole connected wall moving. */
++static int camera_turn(void) {
++    enum {N=6};
++    saturn_vk_vdp1_op p[2*N],c[2*N+1],o[2*N+1];
++    for(unsigned i=0;i<N;i++) {
++        p[i]=quad((int)i*10,1);                      /* repeated wall tile */
++        p[N+i]=quad((int)i*10,100+i);                /* distinct trim below it */
++        for(unsigned k=1;k<8;k+=2)p[N+i].xy[k]+=10;
++    }
++    for(unsigned i=0;i<2*N;i++){c[i]=p[i];for(unsigned k=0;k<8;k+=2)c[i].xy[k]+=10;}
++    c[2*N]=quad(0,1);                                /* tile entering at the left edge */
++    int32_t sx,sy;geometry_camera_shift(p,2*N,c,2*N+1,&sx,&sy);
++    CHECK(sx==10&&sy==0);
++    geometry_interpolate(p,2*N,c,2*N+1,0,o);geometry_weld(c,2*N+1,o);
++    for(unsigned i=0;i<2*N+1;i++) {
++        CHECK(o[i].flip&SATURN_GEOMETRY_FLOAT);
++        for(unsigned k=0;k<8;k+=2)CHECK(geometry_xy(&o[i],k)==(float)c[i].xy[k]-10);
++    }
++    return 0;
++}
++
+ static saturn_vk_vdp1_op history(saturn_vk_vdp1_op value) {
+     for(unsigned k=0;k<8;k++){float xy=(float)value.xy[k];memcpy(&value.xy[k],&xy,4);}
+     value.flip|=SATURN_GEOMETRY_FLOAT;return value;
+@@ -154,7 +185,7 @@ static int sonic_r_capture_safety(void) {
+ 
+ int main(void){
+     CHECK(matching_equivalence());
+-    CHECK(!shape_safety());CHECK(!component_safety());CHECK(!sonic_r_capture_safety());
++    CHECK(!shape_safety());CHECK(!component_safety());CHECK(!sonic_r_capture_safety());CHECK(!camera_turn());
+     saturn_vk_vdp1_op p[2]={quad(0,1),quad(100,2)},c[2]={quad(101,2),quad(1,1)},o[2];
+     CHECK(geometry_interpolate(p,2,c,2,0.25f,o)==2);
+     CHECK(geometry_xy(&o[1],0)==0.25f);CHECK(c[1].xy[0]==1);
