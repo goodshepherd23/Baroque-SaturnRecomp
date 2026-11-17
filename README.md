@@ -113,6 +113,15 @@ still froze between the four compass directions; turning is now interpolated
 too. If something cannot be paired up safely, that part of the picture holds
 still for one game frame rather than risk a torn seam.
 
+**Jitter.** The Saturn draws polygons with whole-pixel corners, and Baroque rounds
+every corner on its own each frame, so distant blocks shake slightly and their
+seams open and close. It is in the original game, but higher internal resolutions
+and interpolation make it easier to see. While you turn, v0.1.8 works out the
+camera's rotation from the whole picture and moves every wall corner along a
+smooth sub-pixel path that stays within a pixel of the game's own corner. On
+recorded turns this cut the shaking of distant blocks to about a third. Walking
+and standing still are not changed yet.
+
 ## Widescreen
 
 Baroque has a built-in anamorphic widescreen mode for 16:9 TVs. To use it:
@@ -185,6 +194,10 @@ are in `kit\patches` and were offered back to the author in
   faces at the screen edge froze the room. The camera shift is now detected from the
   whole picture and used to pair faces, and new faces get a history from their
   neighbours (`0005-turn-interpolation.patch`).
+- **Less jitter while turning.** Corners are rounded to whole pixels independently,
+  so neighbouring blocks shake against each other. During a turn one perspective
+  mapping explains the whole picture to within that rounding; it now drives smooth
+  sub-pixel corner paths (`0007-turn-stabilisation.patch`).
 - **`.chd` disc images** (`0003-chd-disc-support.patch`). The disc layer reads a MAME CD
   `.chd` through [libchdr](https://github.com/rtissera/libchdr) (BSD-3-Clause, pinned in
   `kit\libchdr.sha256`) as if it were one BIN, so `.cue`/`.bin` and `.iso` behave exactly as

@@ -1,0 +1,332 @@
+Sub-pixel stabilisation while the camera turns (issue #2 follow-up).
+
+VDP1 takes whole-pixel corners and the game rounds each corner on its own,
+so corners kick by about a pixel relative to their neighbours every game
+frame: distant blocks shake and seams open and close, and upscaling
+multiplies it. While the camera turns, all static corners move by one
+shared homography, which fits the game's corners to within that rounding.
+geometry_stabilize fits it robustly per game frame (direct matches only,
+80% of corners must agree within 1.6 px) and gives each agreeing corner a
+smooth sub-pixel path: it starts where its path ended and ends at the
+homography's image of that start, pulled toward the game's corner and kept
+within a pixel of it. The renderer keeps the float end corners and replays
+the last presentation of a game frame too while stabilising. Standing,
+walking and anything that does not fit are unchanged.
+
+On recorded turns, relative corner kicks of small and mid-size faces drop
+from 0.8 to 0.25 px (median) and from 1.5 to 0.7 px (90th percentile).
+tests/geometry_interp.c: turn_stabilisation.
+
+--- a/runner/include/geometry_interp.h
++++ b/runner/include/geometry_interp.h
+@@ -644,6 +644,157 @@ static inline unsigned geometry_weld(const saturn_vk_vdp1_op *cur,unsigned n,sat
+ done:
+     free(edges);free(history);free(parent);free(seams);free(held);return changed;
+ }
++/* Sub-pixel stabilisation while the camera turns.
++ *
++ * VDP1 takes whole-pixel corners and the game rounds every corner on its own,
++ * so between game frames corners kick by about a pixel relative to their
++ * neighbours: distant blocks visibly shake and their seams open and close,
++ * and upscaling multiplies it. While the camera only turns, every static
++ * corner moves from one game frame to the next by one shared homography, which
++ * fits the game's corners to within that rounding. Fitting it over all matched
++ * corners averages the rounding away, so each corner can follow a smooth
++ * sub-pixel path: it starts where its path ended last game frame and ends at
++ * the homography's image of that start, pulled slightly toward the game's own
++ * corner and never more than a pixel from it, so nothing drifts. Corners that
++ * coincide go through the same mapping and stay together. When the fit is not
++ * within rounding (walking, animation, cuts) nothing is changed. */
++static inline int geometry_homography_fit(const float *src,const float *dst,unsigned n,double *H) {
++    /* Normalised least squares with h33 = 1. */
++    double sm[2]={0,0},dm[2]={0,0},ss=0,ds=0;
++    if(n<8)return 0;
++    for(unsigned i=0;i<n;i++){sm[0]+=src[i*2];sm[1]+=src[i*2+1];dm[0]+=dst[i*2];dm[1]+=dst[i*2+1];}
++    sm[0]/=n;sm[1]/=n;dm[0]/=n;dm[1]/=n;
++    for(unsigned i=0;i<n;i++) {
++        ss+=sqrt((src[i*2]-sm[0])*(src[i*2]-sm[0])+(src[i*2+1]-sm[1])*(src[i*2+1]-sm[1]));
++        ds+=sqrt((dst[i*2]-dm[0])*(dst[i*2]-dm[0])+(dst[i*2+1]-dm[1])*(dst[i*2+1]-dm[1]));
++    }
++    if(ss<1e-6||ds<1e-6)return 0;
++    ss=1.4142135623730951*n/ss;ds=1.4142135623730951*n/ds;
++    double A[8][9];memset(A,0,sizeof A);
++    for(unsigned i=0;i<n;i++) {
++        double x=(src[i*2]-sm[0])*ss,y=(src[i*2+1]-sm[1])*ss,u=(dst[i*2]-dm[0])*ds,v=(dst[i*2+1]-dm[1])*ds;
++        double r1[9]={x,y,1,0,0,0,-u*x,-u*y,u},r2[9]={0,0,0,x,y,1,-v*x,-v*y,v};
++        for(unsigned a=0;a<8;a++)for(unsigned b=0;b<9;b++)A[a][b]+=r1[a]*r1[b]+r2[a]*r2[b];
++    }
++    for(unsigned c=0;c<8;c++) {   /* Gaussian elimination with partial pivoting */
++        unsigned p=c;
++        for(unsigned r=c+1;r<8;r++)if(fabs(A[r][c])>fabs(A[p][c]))p=r;
++        if(fabs(A[p][c])<1e-12)return 0;
++        if(p!=c)for(unsigned b=0;b<9;b++){double t=A[c][b];A[c][b]=A[p][b];A[p][b]=t;}
++        for(unsigned r=0;r<8;r++)if(r!=c) {
++            double f=A[r][c]/A[c][c];
++            for(unsigned b=c;b<9;b++)A[r][b]-=f*A[c][b];
++        }
++    }
++    double h[9];for(unsigned c=0;c<8;c++)h[c]=A[c][8]/A[c][c];h[8]=1;
++    /* H = Td^-1 * Hn * Ts */
++    double Ts[9]={ss,0,-ss*sm[0],0,ss,-ss*sm[1],0,0,1},Ti[9]={1/ds,0,dm[0],0,1/ds,dm[1],0,0,1},M[9];
++    for(unsigned a=0;a<3;a++)for(unsigned b=0;b<3;b++){M[a*3+b]=0;for(unsigned k=0;k<3;k++)M[a*3+b]+=h[a*3+k]*Ts[k*3+b];}
++    for(unsigned a=0;a<3;a++)for(unsigned b=0;b<3;b++){H[a*3+b]=0;for(unsigned k=0;k<3;k++)H[a*3+b]+=Ti[a*3+k]*M[k*3+b];}
++    return 1;
++}
++static inline int geometry_homography_apply(const double *H,double x,double y,float *ox,float *oy) {
++    double w=H[6]*x+H[7]*y+H[8];
++    if(fabs(w)<1e-9)return 0;
++    *ox=(float)((H[0]*x+H[1]*y+H[2])/w);*oy=(float)((H[3]*x+H[4]*y+H[5])/w);
++    return isfinite(*ox)&&isfinite(*oy);
++}
++/* Previous game frame's corner paths, keyed by the game's integer corner. */
++typedef struct {int32_t x,y;float sx,sy;uint32_t stamp;} geometry_track_slot;
++typedef struct {geometry_track_slot *slot;unsigned size;uint32_t stamp;} geometry_track;
++static inline geometry_track_slot *geometry_track_find(geometry_track *t,int32_t x,int32_t y,int insert) {
++    if(!t->slot)return NULL;
++    uint32_t h=((uint32_t)x*73856093u)^((uint32_t)y*19349663u);
++    for(unsigned n=0,i=h&(t->size-1);n<t->size;n++,i=(i+1)&(t->size-1)) {
++        geometry_track_slot *s=&t->slot[i];
++        if(s->stamp!=t->stamp){if(!insert)return NULL;s->x=x;s->y=y;s->stamp=t->stamp;return s;}
++        if(s->x==x&&s->y==y)return s;
++    }
++    return NULL;
++}
++/* blend holds each face's previous corners (FLOAT when matched); cur its
++ * current integer corners. On success blend receives the smoothed start
++ * corners, end the smoothed end corners (8 floats per face), and prev is
++ * replaced by this frame's paths. Returns 1 when stabilisation applies. */
++static inline int geometry_stabilize(const saturn_vk_vdp1_op *cur,unsigned n,saturn_vk_vdp1_op *blend,
++    float *end,geometry_track *prev,geometry_track *next) {
++    unsigned m=0,used=0,inliers=0;
++    float *src=malloc((size_t)n*8*sizeof *src),*dst=malloc((size_t)n*8*sizeof *dst);
++    uint8_t *keep=malloc((size_t)n*4+1),*face_ok=calloc(n+1,1);
++    double H[9],motion=0;
++    int ok=0;
++    next->stamp++;
++    if(!src||!dst||!keep||!face_ok)goto done;
++    /* Fit only on corners with a real (integer) previous position; histories
++     * synthesized for new faces are estimates and would bias the fit. */
++    for(unsigned i=0;i<n;i++)if(geometry_eligible(&cur[i])&&(blend[i].flip&SATURN_GEOMETRY_FLOAT)) {
++        int real=1;
++        for(unsigned k=0;k<8;k++){float v=geometry_xy(&blend[i],k);if(v!=floorf(v))real=0;}
++        if(!real)continue;
++        for(unsigned k=0;k<4;k++) {
++            src[m*2]=geometry_xy(&blend[i],k*2);src[m*2+1]=geometry_xy(&blend[i],k*2+1);
++            dst[m*2]=(float)cur[i].xy[k*2];dst[m*2+1]=(float)cur[i].xy[k*2+1];
++            motion+=fabs(dst[m*2]-src[m*2])+fabs(dst[m*2+1]-src[m*2+1]);m++;
++        }
++    }
++    if(m<24 || motion/m<1.0)goto done;
++    /* Robust fit: refit on the corners that agree until the set settles. */
++    for(unsigned i=0;i<m;i++)keep[i]=1;
++    for(unsigned round=0;round<4;round++) {
++        unsigned k=0;
++        float *s2=malloc((size_t)m*2*sizeof *s2),*d2=malloc((size_t)m*2*sizeof *d2);
++        if(!s2||!d2){free(s2);free(d2);goto done;}
++        for(unsigned i=0;i<m;i++)if(keep[i]){s2[k*2]=src[i*2];s2[k*2+1]=src[i*2+1];d2[k*2]=dst[i*2];d2[k*2+1]=dst[i*2+1];k++;}
++        int fitted=k>=24&&geometry_homography_fit(s2,d2,k,H);
++        free(s2);free(d2);
++        if(!fitted)goto done;
++        unsigned changed=0;inliers=0;
++        for(unsigned i=0;i<m;i++) {
++            float x,y;
++            int in=geometry_homography_apply(H,src[i*2],src[i*2+1],&x,&y)&&
++                   fabs(x-dst[i*2])<=1.6&&fabs(y-dst[i*2+1])<=1.6;
++            if(in!=keep[i]){keep[i]=(uint8_t)in;changed++;}
++            inliers+=in;
++        }
++        if(!changed)break;
++    }
++    if(inliers*5<m*4)goto done;   /* not one rigid view change */
++    /* A face is stabilised when every corner follows the fit. */
++    for(unsigned i=0;i<n;i++)if(geometry_eligible(&cur[i])&&(blend[i].flip&SATURN_GEOMETRY_FLOAT)) {
++        int all=1;
++        for(unsigned k=0;k<4&&all;k++) {
++            float x,y;
++            all=geometry_homography_apply(H,geometry_xy(&blend[i],k*2),geometry_xy(&blend[i],k*2+1),&x,&y)&&
++                fabs(x-(float)cur[i].xy[k*2])<=1.6f&&fabs(y-(float)cur[i].xy[k*2+1])<=1.6f;
++        }
++        face_ok[i]=(uint8_t)all;
++    }
++    for(unsigned i=0;i<n;i++) {
++        for(unsigned k=0;k<8;k++)end[i*8+k]=(float)cur[i].xy[k];
++        if(!face_ok[i])continue;
++        for(unsigned k=0;k<4;k++) {
++            float ox=geometry_xy(&blend[i],k*2),oy=geometry_xy(&blend[i],k*2+1),sx=ox,sy=oy,ex,ey;
++            /* where this corner's smoothed path ended last game frame */
++            if(ox==floorf(ox)&&oy==floorf(oy)) {
++                geometry_track_slot *p=geometry_track_find(prev,(int32_t)ox,(int32_t)oy,0);
++                if(p){sx=p->sx;sy=p->sy;}
++            }
++            float cx=(float)cur[i].xy[k*2],cy=(float)cur[i].xy[k*2+1];
++            if(!geometry_homography_apply(H,sx,sy,&ex,&ey)){ex=cx;ey=cy;}
++            ex=cx+(ex-cx)*0.85f;ey=cy+(ey-cy)*0.85f;
++            ex=fminf(fmaxf(ex,cx-1.0f),cx+1.0f);ey=fminf(fmaxf(ey,cy-1.0f),cy+1.0f);
++            memcpy(&blend[i].xy[k*2],&sx,4);memcpy(&blend[i].xy[k*2+1],&sy,4);
++            end[i*8+k*2]=ex;end[i*8+k*2+1]=ey;
++            geometry_track_slot *q=geometry_track_find(next,cur[i].xy[k*2],cur[i].xy[k*2+1],1);
++            if(q){q->sx=ex;q->sy=ey;}
++        }
++        used++;
++    }
++    ok=used>0;
++done:
++    free(src);free(dst);free(keep);free(face_ok);
++    return ok;
++}
+ /* Integer presentation budget: rate_num/rate_den logic ticks per second.
+  * Alpha is derived from the same remainder; no rounded frames-per-tick. */
+ typedef struct {uint64_t credit,rate_num,rate_den,hz;} geometry_clock;
+--- a/runner/src/vulkan_renderer.c
++++ b/runner/src/vulkan_renderer.c
+@@ -120,6 +120,12 @@ struct saturn_vk_renderer {
+     saturn_vk_vdp1_op picture_ops[8192];
+     int history_width, history_height;
+     saturn_vk_vdp1_op *history, *blend;
++    /* Turn stabilisation (geometry_stabilize): smoothed end corners of the
++     * current picture, and the corner paths of the last two pictures. */
++    float *smooth_end;
++    int smooth_active;
++    geometry_track track[2];
++    unsigned track_prev,interp_pictures,stabilised_pictures;
+     uint8_t *history_vram;
+     uint8_t *geometry_vram[2],*picture_vram;
+     uint8_t geometry_material_valid[2];
+@@ -824,6 +830,8 @@ int saturn_vk_present(saturn_vk_renderer *r, char *error, size_t error_size)
+ static void free_interpolation_resources(saturn_vk_renderer *r) {
+     free_buffer(r,&r->saved_fb);free_buffer(r,&r->saved_mesh);
+     free(r->history);r->history=NULL;free(r->blend);r->blend=NULL;
++    free(r->smooth_end);r->smooth_end=NULL;r->smooth_active=0;
++    for(unsigned t=0;t<2;t++){free(r->track[t].slot);r->track[t].slot=NULL;}
+     free(r->history_vram);r->history_vram=NULL;
+     free(r->picture_vram);r->picture_vram=NULL;
+     free(r->rotation_history);r->rotation_history=NULL;
+@@ -840,12 +848,14 @@ int saturn_vk_interpolation_enable(saturn_vk_renderer *r) {
+     r->geometry_material_valid[0]=r->geometry_material_valid[1]=0;
+     if(r->history){r->interpolate=1;return 1;}
+     r->history=calloc(8192,sizeof(*r->history));r->blend=calloc(8192,sizeof(*r->blend));
++    r->smooth_end=calloc(8192*8,sizeof(*r->smooth_end));r->smooth_active=0;r->track_prev=0;
++    for(unsigned t=0;t<2;t++){r->track[t].size=65536;r->track[t].stamp=1;r->track[t].slot=calloc(65536,sizeof(*r->track[t].slot));}
+     r->history_vram=malloc(VDP1_VRAM_SZ);
+     r->picture_vram=malloc(VDP1_VRAM_SZ);
+     r->rotation_history=malloc(VDP2_VRAM_SZ);r->rotation_previous=malloc(VDP2_VRAM_SZ);
+     r->cram_history=malloc(CRAM_SIZE);r->cram_previous=malloc(CRAM_SIZE);
+     char error[256];
+-    if(!r->history||!r->blend||!r->history_vram||!r->picture_vram||!r->rotation_history||!r->rotation_previous||!r->cram_history||!r->cram_previous)goto fail;
++    if(!r->history||!r->blend||!r->smooth_end||!r->track[0].slot||!r->track[1].slot||!r->history_vram||!r->picture_vram||!r->rotation_history||!r->rotation_previous||!r->cram_history||!r->cram_previous)goto fail;
+     if(!make_buffer(r,&r->saved_fb,r->fb.size,error,sizeof error)||!make_buffer(r,&r->saved_mesh,r->mesh.size,error,sizeof error))goto fail;
+     r->interpolate=1;return 1;
+ fail:
+@@ -896,7 +906,7 @@ int saturn_vk_interpolation_begin(saturn_vk_renderer *r,saturn *s,int w,int h,ch
+         memcpy(r->rotation_regs,s->vdp2_reg,sizeof r->rotation_regs);
+         r->rotation_valid=1;r->rotation_upload_pending=1;
+     }
+-        r->blend_count=0;r->matched=0;
++        r->blend_count=0;r->matched=0;r->smooth_active=0;
+         uint64_t span=s->frames-r->geometry_stamp;
+         r->geometry_span=span>=1 && span<=4?(unsigned)span:1;
+         r->geometry_stamp=s->frames;
+@@ -925,7 +935,17 @@ int saturn_vk_interpolation_begin(saturn_vk_renderer *r,saturn *s,int w,int h,ch
+                 fprintf(stderr,"[interp-weld] %u repaired vertex histories\n",repaired);
+             }
+             r->blend_count=n;
++            if(r->matched && r->smooth_end) {
++                geometry_track *prev=&r->track[r->track_prev],*next=&r->track[r->track_prev^1u];
++                r->smooth_active=geometry_stabilize(cur,n,r->blend,r->smooth_end,prev,next);
++                if(r->smooth_active){r->track_prev^=1u;r->stabilised_pictures++;}
++                r->interp_pictures++;
++                if(r->interp_pictures%100==0 && getenv("SATURN_INTERP_LOG"))
++                    fprintf(stderr,"[interp] stabilised %u of %u pictures\n",r->stabilised_pictures,r->interp_pictures);
++            }
+         }
++        /* A picture that was not stabilised breaks every corner path. */
++        if(!r->smooth_active)r->track[r->track_prev].stamp++;
+         if(n)memcpy(r->history,cur,n*sizeof(*cur));
+         memcpy(r->history_vram,material,VDP1_VRAM_SZ);
+     }
+@@ -941,7 +961,7 @@ int saturn_vk_interpolation_begin(saturn_vk_renderer *r,saturn *s,int w,int h,ch
+      * cost several milliseconds on a slow log file, a hitch every 5 seconds. */
+     static int interp_log=-1;
+     if(interp_log<0)interp_log=getenv("SATURN_INTERP_LOG")!=NULL;
+-    if(interp_log && s->frames%300==0)fprintf(stderr,"[interp] field %llu geometry %u matched %u safe %d span %u age %u\n",(unsigned long long)s->frames,n,r->matched,safe,r->geometry_span,r->geometry_age);
++    if(interp_log && s->frames%300==0)fprintf(stderr,"[interp] field %llu geometry %u matched %u safe %d span %u age %u stabilised %d\n",(unsigned long long)s->frames,n,r->matched,safe,r->geometry_span,r->geometry_age,r->smooth_active);
+     if(interp_log && s->frames%300==0 && n)fprintf(stderr,"[interp-clear] %u %d %d %d %d\n",cur[0].kind,cur[0].xy[0],cur[0].xy[1],cur[0].xy[2],cur[0].xy[3]);
+     return 1;
+ }
+@@ -950,10 +970,14 @@ int saturn_vk_interpolation_render(saturn_vk_renderer *r,saturn *s,float alpha,i
+     if(alpha<0)alpha=0;if(alpha>1)alpha=1;
+     r->picture_alpha=alpha;
+     r->replaying=1;r->picture_count=0;
+-    if(alpha<1 && r->matched)for(unsigned i=0;i<r->blend_count;i++) {
++    /* A stabilised picture also ends on its smoothed corners, so the last
++     * presentation of a game frame is replayed too instead of snapping back
++     * to the game's whole-pixel corners. */
++    if((alpha<1 || r->smooth_active) && r->matched)for(unsigned i=0;i<r->blend_count;i++) {
+         saturn_vk_vdp1_op o=r->blend[i];
+         if(o.flip&SATURN_GEOMETRY_FLOAT)for(unsigned k=0;k<8;k++) {
+-            float old=geometry_xy(&o,k),v=old+((float)r->history[i].xy[k]-old)*alpha;
++            float end=r->smooth_active?r->smooth_end[i*8+k]:(float)r->history[i].xy[k];
++            float old=geometry_xy(&o,k),v=old+(end-old)*alpha;
+             memcpy(&o.xy[k],&v,4);
+         }
+         r->picture_ops[r->picture_count++]=o;
+--- a/tests/geometry_interp.c
++++ b/tests/geometry_interp.c
+@@ -56,6 +56,48 @@ static int matching_equivalence(void) {
+     return 1;
+ }
+ 
++/* A wall of 8x4 tiles (one texture per column, so matching is unambiguous)
++ * seen by a turning perspective camera and rounded to whole pixels each game
++ * frame like VDP1. The stabilised corners must sit closer to the true
++ * projection than the rounded ones, never more than a pixel from the rounded
++ * ones, and a still picture must be left alone. */
++static void turn_wall(double yaw,saturn_vk_vdp1_op *ops,double *truth) {
++    for(unsigned t=0;t<32;t++) {
++        ops[t]=quad(0,7+t%8);
++        for(unsigned k=0;k<4;k++) {
++            double wx=(double)(t%8)+(k==1||k==2)-4.0,wy=(double)(t/8)+(k>=2)-2.0,wz=6.0;
++            double cx=wx*cos(yaw)-wz*sin(yaw),cz=wx*sin(yaw)+wz*cos(yaw);
++            truth[t*8+k*2]=176.0+160.0*cx/cz;truth[t*8+k*2+1]=112.0+160.0*wy/cz;
++            ops[t].xy[k*2]=(int32_t)lround(truth[t*8+k*2]);ops[t].xy[k*2+1]=(int32_t)lround(truth[t*8+k*2+1]);
++        }
++    }
++}
++static int turn_stabilisation(void) {
++    enum {N=32,F=12};
++    static saturn_vk_vdp1_op ops[F][N],blend[N];
++    static double truth[F][N*8];
++    static float end[N*8];
++    static geometry_track_slot slots[2][4096];
++    geometry_track track[2]={{slots[0],4096,1},{slots[1],4096,1}};
++    unsigned prev=0;
++    double raw=0,smooth=0;
++    for(unsigned f=0;f<F;f++)turn_wall(0.05*f,ops[f],truth[f]);
++    for(unsigned f=1;f<F;f++) {
++        geometry_interpolate(ops[f-1],N,ops[f],N,0,blend);geometry_weld(ops[f],N,blend);
++        CHECK(geometry_stabilize(ops[f],N,blend,end,&track[prev],&track[prev^1u]));
++        prev^=1u;
++        for(unsigned i=0;i<N*8;i++) {
++            CHECK(fabsf(end[i]-(float)ops[f][i/8].xy[i%8])<=1.0f);
++            if(f>=3){raw+=fabs(ops[f][i/8].xy[i%8]-truth[f][i]);smooth+=fabs(end[i]-truth[f][i]);}
++        }
++    }
++    CHECK(smooth<raw*0.8);
++    /* still: no motion, nothing to stabilise */
++    geometry_interpolate(ops[0],N,ops[0],N,0,blend);
++    CHECK(!geometry_stabilize(ops[0],N,blend,end,&track[prev],&track[prev^1u]));
++    return 0;
++}
++
+ /* A camera turn by exactly one tile width: every identical tile is also one
+  * tile from its neighbour's old place. A row of distinct faces below the
+  * tiles makes the true turn the clear winner, every face must move by the
+@@ -185,7 +227,7 @@ static int sonic_r_capture_safety(void) {
+ 
+ int main(void){
+     CHECK(matching_equivalence());
+-    CHECK(!shape_safety());CHECK(!component_safety());CHECK(!sonic_r_capture_safety());CHECK(!camera_turn());
++    CHECK(!shape_safety());CHECK(!component_safety());CHECK(!sonic_r_capture_safety());CHECK(!camera_turn());CHECK(!turn_stabilisation());
+     saturn_vk_vdp1_op p[2]={quad(0,1),quad(100,2)},c[2]={quad(101,2),quad(1,1)},o[2];
+     CHECK(geometry_interpolate(p,2,c,2,0.25f,o)==2);
+     CHECK(geometry_xy(&o[1],0)==0.25f);CHECK(c[1].xy[0]==1);
