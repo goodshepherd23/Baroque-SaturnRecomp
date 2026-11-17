@@ -116,11 +116,12 @@ still for one game frame rather than risk a torn seam.
 **Jitter.** The Saturn draws polygons with whole-pixel corners, and Baroque rounds
 every corner on its own each frame, so distant blocks shake slightly and their
 seams open and close. It is in the original game, but higher internal resolutions
-and interpolation make it easier to see. While you turn, v0.1.8 works out the
-camera's rotation from the whole picture and moves every wall corner along a
-smooth sub-pixel path that stays within a pixel of the game's own corner. On
-recorded turns this cut the shaking of distant blocks to about a third. Walking
-and standing still are not changed yet.
+and interpolation make it easier to see. While you turn or walk, the runtime
+works out how each flat wall, floor and ceiling surface is moving and moves its
+corners along smooth sub-pixel paths that stay within a pixel of the game's own
+corners (since v0.1.8 for turning, v0.1.9 for walking). On recorded turns and
+walks this cut the shaking of blocks against their neighbours to between a third
+and a half. Standing still keeps the original game's slight wobble.
 
 ## Widescreen
 
@@ -198,6 +199,9 @@ are in `kit\patches` and were offered back to the author in
   so neighbouring blocks shake against each other. During a turn one perspective
   mapping explains the whole picture to within that rounding; it now drives smooth
   sub-pixel corner paths (`0007-turn-stabilisation.patch`).
+- **Less jitter while walking.** Near and far surfaces move differently, so each
+  face is now predicted from the flat patch of faces around it; corners shared by
+  several faces keep one value (`0008-walk-stabilisation.patch`).
 - **`.chd` disc images** (`0003-chd-disc-support.patch`). The disc layer reads a MAME CD
   `.chd` through [libchdr](https://github.com/rtissera/libchdr) (BSD-3-Clause, pinned in
   `kit\libchdr.sha256`) as if it were one BIN, so `.cue`/`.bin` and `.iso` behave exactly as

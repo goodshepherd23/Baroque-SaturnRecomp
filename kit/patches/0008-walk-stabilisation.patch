@@ -1,0 +1,427 @@
+Sub-pixel stabilisation while walking, too.
+
+Walking moves surfaces at different depths differently, so the whole-picture
+homography from 0007 does not apply, and fitted anyway it biased every path.
+It is now used only for a turn (corners shift sideways by about the same
+amount: median shift >= 4 px with spread <= 35% of it). Otherwise each face
+fits a homography over the faces within two steps of it (one step when the
+larger patch crosses a surface edge); a patch is trusted only within the
+rounding (every corner <= 1.6 px, RMS <= 0.5 px). Corners take the mean of
+their predictions and keep one shared value. Every corner starts where its
+path ended even when this picture is not smoothed, and a corner without a
+vote keeps half of last frame's offset, so corners near surface edges ease
+back instead of jumping. A corner -> faces index keeps the patches cheap.
+
+Recorded walk: relative corner kicks 0.93/0.79/0.50 -> 0.42/0.27/0.17 px
+median (small/mid/large faces), p99 no worse than the game's. Recorded turn
+as in 0.1.8 or better. No measurable frame-time cost against 0.1.8.
+tests/geometry_interp.c: walk_stabilisation (no bias, shared corners).
+
+--- a/runner/include/geometry_interp.h
++++ b/runner/include/geometry_interp.h
+@@ -644,7 +644,7 @@ static inline unsigned geometry_weld(const saturn_vk_vdp1_op *cur,unsigned n,sat
+ done:
+     free(edges);free(history);free(parent);free(seams);free(held);return changed;
+ }
+-/* Sub-pixel stabilisation while the camera turns.
++/* Sub-pixel stabilisation while the camera moves.
+  *
+  * VDP1 takes whole-pixel corners and the game rounds every corner on its own,
+  * so between game frames corners kick by about a pixel relative to their
+@@ -655,9 +655,12 @@ done:
+  * corners averages the rounding away, so each corner can follow a smooth
+  * sub-pixel path: it starts where its path ended last game frame and ends at
+  * the homography's image of that start, pulled slightly toward the game's own
+- * corner and never more than a pixel from it, so nothing drifts. Corners that
+- * coincide go through the same mapping and stay together. When the fit is not
+- * within rounding (walking, animation, cuts) nothing is changed. */
++ * corner and never more than a pixel from it, so nothing drifts. Walking
++ * moves surfaces at different depths differently, but each flat surface
++ * still moves by its own homography, so there each face is predicted from a
++ * small patch of faces around it instead. Corners that coincide share one
++ * value and stay together. Anything that fits no homography within the
++ * rounding (animation, cuts, surface edges) keeps the game's corners. */
+ static inline int geometry_homography_fit(const float *src,const float *dst,unsigned n,double *H) {
+     /* Normalised least squares with h33 = 1. */
+     double sm[2]={0,0},dm[2]={0,0},ss=0,ds=0;
+@@ -713,42 +716,100 @@ static inline geometry_track_slot *geometry_track_find(geometry_track *t,int32_t
+     return NULL;
+ }
+ /* blend holds each face's previous corners (FLOAT when matched); cur its
+- * current integer corners. On success blend receives the smoothed start
+- * corners, end the smoothed end corners (8 floats per face), and prev is
+- * replaced by this frame's paths. Returns 1 when stabilisation applies. */
++ * current integer corners. Every corner of the picture gets one smoothed end
++ * position, shared by all faces that use it, so seams cannot open:
++ *   - each corner starts where its smoothed path ended last game frame;
++ *   - while the camera turns (every corner shifts sideways by about the
++ *     same amount), one homography over all matched corners predicts every
++ *     corner that follows it;
++ *   - otherwise (walking) each face fits a homography over the faces within
++ *     two steps of it, or failing that one step; a flat patch fits within the
++ *     rounding and predicts that face's corners, a patch across a wall/floor
++ *     edge does not fit and stays silent;
++ *   - a corner takes the mean of its predictions, pulled toward the game's
++ *     corner and kept within a pixel of it; a corner without one keeps half
++ *     of last frame's offset, easing back to the game's corner.
++ * blend receives the smoothed start corners, end the end corners (8 floats
++ * per face), next this picture's corner paths. Returns 1 when any corner was
++ * smoothed. */
++typedef struct {int32_t x,y;double px,py;unsigned votes;uint32_t stamp;} geometry_corner;
++static inline geometry_corner *geometry_corner_find(geometry_corner *t,unsigned size,uint32_t stamp,int32_t x,int32_t y) {
++    uint32_t h=((uint32_t)x*73856093u)^((uint32_t)y*19349663u);
++    for(unsigned n=0,i=h&(size-1);n<size;n++,i=(i+1)&(size-1)) {
++        geometry_corner *c=&t[i];
++        if(c->stamp!=stamp){c->x=x;c->y=y;c->px=c->py=0;c->votes=0;c->stamp=stamp;return c;}
++        if(c->x==x&&c->y==y)return c;
++    }
++    return NULL;
++}
++/* Whole-pixel rounding of both pictures alone leaves an RMS residual of about
++ * 0.4 px per coordinate; a model that is wrong (two planes fitted as one,
++ * say) stays under the 1.6 px limit per corner yet drags every path along a
++ * biased mapping. Both limits must hold. */
++static inline int geometry_float_compare(const void *a,const void *b) {
++    float x=*(const float*)a,y=*(const float*)b;return x<y?-1:x>y;
++}
++static inline float geometry_median_f(float *v,unsigned n) {
++    if(!n)return 0;
++    qsort(v,n,sizeof *v,geometry_float_compare);return v[n/2];
++}
++static inline int geometry_fit_check(const float *src,const float *dst,unsigned m,double *H) {
++    double ss=0;
++    if(m<16||!geometry_homography_fit(src,dst,m,H))return 0;
++    for(unsigned i=0;i<m;i++) {
++        float x,y;
++        if(!geometry_homography_apply(H,src[i*2],src[i*2+1],&x,&y))return 0;
++        if(fabs(x-dst[i*2])>1.6||fabs(y-dst[i*2+1])>1.6)return 0;
++        ss+=(x-dst[i*2])*(x-dst[i*2])+(y-dst[i*2+1])*(y-dst[i*2+1]);
++    }
++    return sqrt(ss/(2.0*m))<=0.5;
++}
+ static inline int geometry_stabilize(const saturn_vk_vdp1_op *cur,unsigned n,saturn_vk_vdp1_op *blend,
+     float *end,geometry_track *prev,geometry_track *next) {
+-    unsigned m=0,used=0,inliers=0;
++    unsigned m=0,size=1,voted=0,inliers=0,global=0;
+     float *src=malloc((size_t)n*8*sizeof *src),*dst=malloc((size_t)n*8*sizeof *dst);
+-    uint8_t *keep=malloc((size_t)n*4+1),*face_ok=calloc(n+1,1);
++    float *start=malloc((size_t)n*8*sizeof *start);
++    uint8_t *real=calloc(n+1,1),*keep=malloc((size_t)n*4+1);
++    int *ring=malloc((size_t)n*sizeof *ring);
+     double H[9],motion=0;
+-    int ok=0;
++    unsigned *face_corner=NULL,*adj_start=NULL,*adj_face=NULL,*mark=NULL,ncorner=0;
++    int adj_ok=0;
++    static uint32_t stamp;
++    while(size<n*8u+16u)size<<=1;
++    geometry_corner *corner=malloc((size_t)size*sizeof *corner);
+     next->stamp++;
+-    if(!src||!dst||!keep||!face_ok)goto done;
+-    /* Fit only on corners with a real (integer) previous position; histories
+-     * synthesized for new faces are estimates and would bias the fit. */
+-    for(unsigned i=0;i<n;i++)if(geometry_eligible(&cur[i])&&(blend[i].flip&SATURN_GEOMETRY_FLOAT)) {
+-        int real=1;
+-        for(unsigned k=0;k<8;k++){float v=geometry_xy(&blend[i],k);if(v!=floorf(v))real=0;}
+-        if(!real)continue;
++    for(unsigned i=0;i<n;i++)for(unsigned k=0;k<8;k++)end[i*8+k]=(float)cur[i].xy[k];
++    if(!src||!dst||!start||!real||!keep||!ring||!corner)goto done;
++    stamp++;for(unsigned i=0;i<size;i++)corner[i].stamp=stamp-1u;
++    /* Start corners: where each corner's path ended last game frame. */
++    for(unsigned i=0;i<n;i++) {
++        if(!geometry_eligible(&cur[i])||!(blend[i].flip&SATURN_GEOMETRY_FLOAT))continue;
++        int integral=1;
++        for(unsigned k=0;k<8;k++){float v=geometry_xy(&blend[i],k);start[i*8+k]=v;if(v!=floorf(v))integral=0;}
++        real[i]=(uint8_t)integral;
++        if(!integral)continue;
++        for(unsigned k=0;k<4;k++) {
++            geometry_track_slot *p=geometry_track_find(prev,(int32_t)start[i*8+k*2],(int32_t)start[i*8+k*2+1],0);
++            if(p){start[i*8+k*2]=p->sx;start[i*8+k*2+1]=p->sy;}
++        }
+         for(unsigned k=0;k<4;k++) {
+             src[m*2]=geometry_xy(&blend[i],k*2);src[m*2+1]=geometry_xy(&blend[i],k*2+1);
+             dst[m*2]=(float)cur[i].xy[k*2];dst[m*2+1]=(float)cur[i].xy[k*2+1];
+             motion+=fabs(dst[m*2]-src[m*2])+fabs(dst[m*2+1]-src[m*2+1]);m++;
+         }
+     }
+-    if(m<24 || motion/m<1.0)goto done;
+-    /* Robust fit: refit on the corners that agree until the set settles. */
++    if(m<16 || motion/m<1.0)goto keep_paths;
++    /* Turning: one homography for the whole picture (robust refit). */
+     for(unsigned i=0;i<m;i++)keep[i]=1;
+     for(unsigned round=0;round<4;round++) {
+-        unsigned k=0;
++        unsigned k=0,changed=0;
+         float *s2=malloc((size_t)m*2*sizeof *s2),*d2=malloc((size_t)m*2*sizeof *d2);
+-        if(!s2||!d2){free(s2);free(d2);goto done;}
++        if(!s2||!d2){free(s2);free(d2);break;}
+         for(unsigned i=0;i<m;i++)if(keep[i]){s2[k*2]=src[i*2];s2[k*2+1]=src[i*2+1];d2[k*2]=dst[i*2];d2[k*2+1]=dst[i*2+1];k++;}
+         int fitted=k>=24&&geometry_homography_fit(s2,d2,k,H);
+         free(s2);free(d2);
+-        if(!fitted)goto done;
+-        unsigned changed=0;inliers=0;
++        if(!fitted){inliers=0;break;}
++        inliers=0;
+         for(unsigned i=0;i<m;i++) {
+             float x,y;
+             int in=geometry_homography_apply(H,src[i*2],src[i*2+1],&x,&y)&&
+@@ -758,42 +819,133 @@ static inline int geometry_stabilize(const saturn_vk_vdp1_op *cur,unsigned n,sat
+         }
+         if(!changed)break;
+     }
+-    if(inliers*5<m*4)goto done;   /* not one rigid view change */
+-    /* A face is stabilised when every corner follows the fit. */
+-    for(unsigned i=0;i<n;i++)if(geometry_eligible(&cur[i])&&(blend[i].flip&SATURN_GEOMETRY_FLOAT)) {
+-        int all=1;
+-        for(unsigned k=0;k<4&&all;k++) {
++    /* The whole-picture homography is only trusted for a turn: then every
++     * corner moves sideways by about the same amount. Walking forward spreads
++     * the motion outwards from the centre, and a homography fitted across
++     * several surfaces at different depths would bias every path. */
++    {
++        float *mx=malloc((size_t)m*sizeof *mx),*my=malloc((size_t)m*sizeof *my),*dv=malloc((size_t)m*sizeof *dv);
++        int turn=0;
++        if(mx&&my&&dv) {
++            for(unsigned i=0;i<m;i++){mx[i]=dst[i*2]-src[i*2];my[i]=dst[i*2+1]-src[i*2+1];}
++            float cx=geometry_median_f(mx,m),cy=geometry_median_f(my,m);
++            for(unsigned i=0;i<m;i++){mx[i]=dst[i*2]-src[i*2];my[i]=dst[i*2+1]-src[i*2+1];dv[i]=hypotf(mx[i]-cx,my[i]-cy);}
++            float shift=hypotf(cx,cy),spread=geometry_median_f(dv,m);
++            turn=shift>=4.0f&&spread<=0.35f*shift;
++        }
++        free(mx);free(my);free(dv);
++        global=turn&&m>=24&&inliers*5>=m*4;
++    }
++    /* Corner -> faces index over faces with a real history, for the rings. */
++    face_corner=malloc((size_t)n*4*sizeof *face_corner);mark=calloc(n+1,sizeof *mark);
++    if(face_corner&&mark) {
++        stamp++;
++        for(unsigned i=0;i<n;i++)if(real[i])for(unsigned k=0;k<4;k++) {
++            geometry_corner *c=geometry_corner_find(corner,size,stamp,cur[i].xy[k*2],cur[i].xy[k*2+1]);
++            if(!c){ncorner=0;break;}
++            if(!c->votes){c->votes=++ncorner;}   /* votes holds id+1 while indexing */
++            face_corner[i*4+k]=c->votes-1u;
++        }
++        adj_start=calloc(ncorner+2,sizeof *adj_start);adj_face=malloc((size_t)n*4*sizeof *adj_face+1);
++        if(adj_start&&adj_face&&ncorner) {
++            for(unsigned i=0;i<n;i++)if(real[i])for(unsigned k=0;k<4;k++)adj_start[face_corner[i*4+k]+1]++;
++            for(unsigned c=0;c<ncorner;c++)adj_start[c+1]+=adj_start[c];
++            unsigned *fill=calloc(ncorner+1,sizeof *fill);
++            if(fill) {
++                for(unsigned i=0;i<n;i++)if(real[i])for(unsigned k=0;k<4;k++) {
++                    unsigned id=face_corner[i*4+k];
++                    adj_face[adj_start[id]+fill[id]++]=i;
++                }
++                adj_ok=1;free(fill);
++            }
++        }
++        stamp++;   /* fresh corner table for the votes */
++    }
++    /* Each face votes for its own corners, from the global homography when it
++     * follows it, else from a homography over the faces touching it. */
++    for(unsigned i=0;i<n;i++) {
++        if(!real[i])continue;
++        double L[9];const double *use=NULL;
++        if(global) {
++            int all=1;
++            for(unsigned k=0;k<4&&all;k++) {
++                float x,y;
++                all=geometry_homography_apply(H,geometry_xy(&blend[i],k*2),geometry_xy(&blend[i],k*2+1),&x,&y)&&
++                    fabs(x-(float)cur[i].xy[k*2])<=1.6f&&fabs(y-(float)cur[i].xy[k*2+1])<=1.6f;
++            }
++            if(all)use=H;
++        }
++        if(!use && adj_ok) {
++            /* rings: the face and every face sharing a corner with it, then
++             * also their neighbours. The larger patch averages more rounding;
++             * across a surface edge it does not fit and the smaller is tried. */
++            unsigned rn=0,r1=0;
++            ring[rn++]=(int)i;mark[i]=i+1u;
++            for(unsigned step=0;step<2;step++) {
++                unsigned from=step?1:0,to=rn;
++                for(unsigned q=from;q<to;q++) {
++                    unsigned f=(unsigned)ring[q];
++                    for(unsigned k=0;k<4;k++) {
++                        unsigned id=face_corner[f*4+k];
++                        for(unsigned e=adj_start[id];e<adj_start[id+1];e++) {
++                            unsigned g=adj_face[e];
++                            if(mark[g]!=i+1u){mark[g]=i+1u;ring[rn++]=(int)g;}
++                        }
++                    }
++                }
++                if(!step)r1=rn;
++            }
++            for(int pass=0;pass<2&&!use;pass++) {
++                unsigned count=pass?r1:rn,lm=0;
++                if(count<3||(pass&&r1==rn))continue;
++                for(unsigned r=0;r<count;r++)for(unsigned k=0;k<4;k++) {
++                    unsigned j=(unsigned)ring[r];
++                    src[lm*2]=geometry_xy(&blend[j],k*2);src[lm*2+1]=geometry_xy(&blend[j],k*2+1);
++                    dst[lm*2]=(float)cur[j].xy[k*2];dst[lm*2+1]=(float)cur[j].xy[k*2+1];lm++;
++                }
++                if(geometry_fit_check(src,dst,lm,L))use=L;
++            }
++        }
++        if(!use)continue;
++        for(unsigned k=0;k<4;k++) {
+             float x,y;
+-            all=geometry_homography_apply(H,geometry_xy(&blend[i],k*2),geometry_xy(&blend[i],k*2+1),&x,&y)&&
+-                fabs(x-(float)cur[i].xy[k*2])<=1.6f&&fabs(y-(float)cur[i].xy[k*2+1])<=1.6f;
++            if(!geometry_homography_apply(use,start[i*8+k*2],start[i*8+k*2+1],&x,&y))continue;
++            geometry_corner *c=geometry_corner_find(corner,size,stamp,cur[i].xy[k*2],cur[i].xy[k*2+1]);
++            if(c){c->px+=x;c->py+=y;c->votes++;}
+         }
+-        face_ok[i]=(uint8_t)all;
+     }
++    /* Every face uses the shared corner values. A corner without a vote this
++     * game frame keeps half of last frame's smoothing offset rather than
++     * snapping back to the whole pixel, so corners near a surface edge that
++     * only vote now and then do not jump. */
++    for(unsigned i=0;i<n;i++)for(unsigned k=0;k<4;k++) {
++        geometry_corner *c=geometry_corner_find(corner,size,stamp,cur[i].xy[k*2],cur[i].xy[k*2+1]);
++        if(!c)continue;
++        float cx=(float)cur[i].xy[k*2],cy=(float)cur[i].xy[k*2+1],ex,ey;
++        if(!c->votes) {
++            if(!real[i])continue;
++            ex=cx+(start[i*8+k*2]-geometry_xy(&blend[i],k*2))*0.5f;
++            ey=cy+(start[i*8+k*2+1]-geometry_xy(&blend[i],k*2+1))*0.5f;
++        } else {
++            ex=cx+((float)(c->px/c->votes)-cx)*0.85f;ey=cy+((float)(c->py/c->votes)-cy)*0.85f;
++        }
++        end[i*8+k*2]=fminf(fmaxf(ex,cx-1.0f),cx+1.0f);end[i*8+k*2+1]=fminf(fmaxf(ey,cy-1.0f),cy+1.0f);
++        voted++;
++    }
++keep_paths:
++    /* Faces with a real history start on their path; store this picture's paths. */
+     for(unsigned i=0;i<n;i++) {
+-        for(unsigned k=0;k<8;k++)end[i*8+k]=(float)cur[i].xy[k];
+-        if(!face_ok[i])continue;
++        if(real[i])for(unsigned k=0;k<8;k++)memcpy(&blend[i].xy[k],&start[i*8+k],4);
++        if(!geometry_eligible(&cur[i]))continue;
+         for(unsigned k=0;k<4;k++) {
+-            float ox=geometry_xy(&blend[i],k*2),oy=geometry_xy(&blend[i],k*2+1),sx=ox,sy=oy,ex,ey;
+-            /* where this corner's smoothed path ended last game frame */
+-            if(ox==floorf(ox)&&oy==floorf(oy)) {
+-                geometry_track_slot *p=geometry_track_find(prev,(int32_t)ox,(int32_t)oy,0);
+-                if(p){sx=p->sx;sy=p->sy;}
+-            }
+-            float cx=(float)cur[i].xy[k*2],cy=(float)cur[i].xy[k*2+1];
+-            if(!geometry_homography_apply(H,sx,sy,&ex,&ey)){ex=cx;ey=cy;}
+-            ex=cx+(ex-cx)*0.85f;ey=cy+(ey-cy)*0.85f;
+-            ex=fminf(fmaxf(ex,cx-1.0f),cx+1.0f);ey=fminf(fmaxf(ey,cy-1.0f),cy+1.0f);
+-            memcpy(&blend[i].xy[k*2],&sx,4);memcpy(&blend[i].xy[k*2+1],&sy,4);
+-            end[i*8+k*2]=ex;end[i*8+k*2+1]=ey;
+             geometry_track_slot *q=geometry_track_find(next,cur[i].xy[k*2],cur[i].xy[k*2+1],1);
+-            if(q){q->sx=ex;q->sy=ey;}
++            if(q){q->sx=end[i*8+k*2];q->sy=end[i*8+k*2+1];}
+         }
+-        used++;
+     }
+-    ok=used>0;
+ done:
+-    free(src);free(dst);free(keep);free(face_ok);
+-    return ok;
++    free(face_corner);free(adj_start);free(adj_face);free(mark);
++    free(src);free(dst);free(start);free(real);free(keep);free(ring);free(corner);
++    return voted>0;
+ }
+ /* Integer presentation budget: rate_num/rate_den logic ticks per second.
+  * Alpha is derived from the same remainder; no rounded frames-per-tick. */
+--- a/runner/src/vulkan_renderer.c
++++ b/runner/src/vulkan_renderer.c
+@@ -906,6 +906,7 @@ int saturn_vk_interpolation_begin(saturn_vk_renderer *r,saturn *s,int w,int h,ch
+         memcpy(r->rotation_regs,s->vdp2_reg,sizeof r->rotation_regs);
+         r->rotation_valid=1;r->rotation_upload_pending=1;
+     }
++        int tracked=0;
+         r->blend_count=0;r->matched=0;r->smooth_active=0;
+         uint64_t span=s->frames-r->geometry_stamp;
+         r->geometry_span=span>=1 && span<=4?(unsigned)span:1;
+@@ -938,14 +939,15 @@ int saturn_vk_interpolation_begin(saturn_vk_renderer *r,saturn *s,int w,int h,ch
+             if(r->matched && r->smooth_end) {
+                 geometry_track *prev=&r->track[r->track_prev],*next=&r->track[r->track_prev^1u];
+                 r->smooth_active=geometry_stabilize(cur,n,r->blend,r->smooth_end,prev,next);
+-                if(r->smooth_active){r->track_prev^=1u;r->stabilised_pictures++;}
++                r->track_prev^=1u;r->stabilised_pictures+=r->smooth_active!=0;
++                tracked=1;
+                 r->interp_pictures++;
+                 if(r->interp_pictures%100==0 && getenv("SATURN_INTERP_LOG"))
+                     fprintf(stderr,"[interp] stabilised %u of %u pictures\n",r->stabilised_pictures,r->interp_pictures);
+             }
+         }
+-        /* A picture that was not stabilised breaks every corner path. */
+-        if(!r->smooth_active)r->track[r->track_prev].stamp++;
++        /* A picture that was not matched breaks every corner path. */
++        if(!tracked)r->track[r->track_prev].stamp++;
+         if(n)memcpy(r->history,cur,n*sizeof(*cur));
+         memcpy(r->history_vram,material,VDP1_VRAM_SZ);
+     }
+--- a/tests/geometry_interp.c
++++ b/tests/geometry_interp.c
+@@ -98,6 +98,59 @@ static int turn_stabilisation(void) {
+     return 0;
+ }
+ 
++/* Walking forward down a corridor: a floor and a side wall, each a different
++ * plane, so no single homography fits the picture. Stabilisation must run on
++ * the faces' own flat patches without bias (no further from the true
++ * projection than the whole-pixel corners), stay within a pixel of them, and
++ * keep one shared position for every corner (no crack where the wall meets
++ * the floor). */
++static unsigned corridor(double z0,saturn_vk_vdp1_op *ops,double *truth) {
++    unsigned n=0;
++    for(unsigned plane=0;plane<2;plane++)for(unsigned a=0;a<4;a++)for(unsigned b=0;b<6;b++) {
++        saturn_vk_vdp1_op *o=&ops[n];
++        *o=quad(0,20+plane*40+a*6+b);   /* one texture per tile: unambiguous */
++        for(unsigned k=0;k<4;k++) {
++            double u=(double)a+(k==1||k==2),v=(double)b+(k>=2),x,y,z;
++            if(!plane){x=u-2.0;y=-1.5;z=v+3.0;}       /* floor */
++            else{x=-2.0;y=u*0.75-1.5;z=v+3.0;}        /* left wall */
++            z-=z0;
++            truth[n*8+k*2]=176.0+160.0*x/z;truth[n*8+k*2+1]=112.0-160.0*y/z;
++            o->xy[k*2]=(int32_t)lround(truth[n*8+k*2]);o->xy[k*2+1]=(int32_t)lround(truth[n*8+k*2+1]);
++        }
++        n++;
++    }
++    return n;
++}
++static int walk_stabilisation(void) {
++    enum {N=48,F=12};
++    static saturn_vk_vdp1_op ops[F][N],blend[N];
++    static double truth[F][N*8];
++    static float end[N*8];
++    static geometry_track_slot slots[2][4096];
++    geometry_track track[2]={{slots[0],4096,1},{slots[1],4096,1}};
++    unsigned prev=0;
++    double raw=0,smooth=0;
++    for(unsigned f=0;f<F;f++)CHECK(corridor(0.12*f,ops[f],truth[f])==N);
++    for(unsigned f=1;f<F;f++) {
++        geometry_interpolate(ops[f-1],N,ops[f],N,0,blend);geometry_weld(ops[f],N,blend);
++        int stab=geometry_stabilize(ops[f],N,blend,end,&track[prev],&track[prev^1u]);
++        prev^=1u;
++        if(f>=2)CHECK(stab);
++        for(unsigned i=0;i<N*8;i++) {
++            CHECK(fabsf(end[i]-(float)ops[f][i/8].xy[i%8])<=1.0f);
++            if(f>=3){raw+=fabs(ops[f][i/8].xy[i%8]-truth[f][i]);smooth+=fabs(end[i]-truth[f][i]);}
++        }
++        /* coinciding corners keep one position */
++        for(unsigned i=0;i<N*4;i++)for(unsigned j=i+1;j<N*4;j++)
++            if(ops[f][i/4].xy[(i%4)*2]==ops[f][j/4].xy[(j%4)*2]&&ops[f][i/4].xy[(i%4)*2+1]==ops[f][j/4].xy[(j%4)*2+1])
++                CHECK(end[(i/4)*8+(i%4)*2]==end[(j/4)*8+(j%4)*2]&&end[(i/4)*8+(i%4)*2+1]==end[(j/4)*8+(j%4)*2+1]);
++    }
++    /* No single homography fits the whole picture here; stabilisation must
++     * not drag corners along a mapping fitted across both planes. */
++    CHECK(smooth<=raw*1.02);
++    return 0;
++}
++
+ /* A camera turn by exactly one tile width: every identical tile is also one
+  * tile from its neighbour's old place. A row of distinct faces below the
+  * tiles makes the true turn the clear winner, every face must move by the
+@@ -227,7 +280,7 @@ static int sonic_r_capture_safety(void) {
+ 
+ int main(void){
+     CHECK(matching_equivalence());
+-    CHECK(!shape_safety());CHECK(!component_safety());CHECK(!sonic_r_capture_safety());CHECK(!camera_turn());CHECK(!turn_stabilisation());
++    CHECK(!shape_safety());CHECK(!component_safety());CHECK(!sonic_r_capture_safety());CHECK(!camera_turn());CHECK(!turn_stabilisation());CHECK(!walk_stabilisation());
+     saturn_vk_vdp1_op p[2]={quad(0,1),quad(100,2)},c[2]={quad(101,2),quad(1,1)},o[2];
+     CHECK(geometry_interpolate(p,2,c,2,0.25f,o)==2);
+     CHECK(geometry_xy(&o[1],0)==0.25f);CHECK(c[1].xy[0]==1);
