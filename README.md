@@ -65,7 +65,11 @@ Setup skips the disc question when it finds a `.cue` or `.chd` in a `disc` folde
 provide, so run the first setup on Windows in portable mode (see below) with the
 disc in the app folder's `disc` folder. Setup then records the disc path relative
 to the game, so the whole folder can be copied to Linux and started there with
-`wine Baroque.exe`. This is not tested by the author.
+`wine Baroque.exe` or Proton. If `game.toml` still holds a path that does not
+exist there (from an older kit, or a disc outside the folder), `Baroque.exe`
+looks for a `.cue`/`.chd` in a `disc` folder or right beside itself and points
+`game.toml` at it (since v0.1.10, noted in `launcher.log`). This is not tested
+under Wine by the author.
 
 ## Controls
 

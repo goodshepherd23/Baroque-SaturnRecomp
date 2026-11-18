@@ -215,6 +215,93 @@ static int restore_power(void) {   /* 1 when nothing is left to restore */
     return !st.pending[AC] && !st.pending[DC];
 }
 
+/* ---------------------------------------------------------- disc path */
+/* game.toml can hold a full Windows path from the PC that ran setup (or from a
+ * kit older than v0.1.7). Under Wine/Proton, or after the folder moves, that
+ * path is gone and setup (PowerShell) may not be able to run. So when the disc
+ * in game.toml is missing, look where setup looks (a disc\ folder beside
+ * Baroque.exe or in the data folder, or right beside Baroque.exe) and point
+ * game.toml at what is found: relative to game.toml when it is inside the data
+ * folder, a full path otherwise. */
+static int find_disc(wchar_t *out) {
+    static const wchar_t *exts[] = { L"cue", L"chd" };
+    wchar_t dirs[3][PATHMAX], pat[PATHMAX];
+    swprintf(dirs[0], PATHMAX, L"%ls\\disc", root); swprintf(dirs[1], PATHMAX, L"%ls\\disc", data);
+    wcscpy(dirs[2], root);
+    for (int d = 0; d < 3; d++)
+        for (int e = 0; e < 2; e++) {
+            WIN32_FIND_DATAW fd;
+            swprintf(pat, PATHMAX, L"%ls\\*.%ls", dirs[d], exts[e]);
+            HANDLE h = FindFirstFileW(pat, &fd);
+            if (h == INVALID_HANDLE_VALUE) continue;
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                    swprintf(out, PATHMAX, L"%ls\\%ls", dirs[d], fd.cFileName);
+                    FindClose(h); return 1;
+                }
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+    return 0;
+}
+
+static void fix_disc(void) {
+    static wchar_t toml[PATHMAX], tmp[PATHMAX], cur[PATHMAX], full[PATHMAX], found[PATHMAX], val[PATHMAX], msg[3 * PATHMAX];
+    static char text[1 << 16], line_new[4 * PATHMAX];
+    path(toml, L"game\\game.toml");
+    FILE *f = _wfopen(toml, L"rb"); if (!f) return;
+    size_t n = fread(text, 1, sizeof text - 1, f); fclose(f); text[n] = 0;
+    if (n == sizeof text - 1) return;
+
+    char *line = text, *ls = NULL, *le = NULL, *q1 = NULL, *q2 = NULL;
+    while (*line) {   /* the  disc = "..."  line */
+        char *end = strchr(line, '\n'); if (!end) end = line + strlen(line);
+        char *p = line; while (*p == ' ' || *p == '\t') p++;
+        if (!strncmp(p, "disc", 4) && (p[4] == ' ' || p[4] == '\t' || p[4] == '=')) {
+            char *a = memchr(p, '"', end - p), *b = a ? memchr(a + 1, '"', end - a - 1) : NULL;
+            if (a && b) { ls = line; le = end; q1 = a; q2 = b; break; }
+        }
+        line = *end ? end + 1 : end;
+    }
+    if (!ls) return;
+    *q2 = 0;
+    int w = MultiByteToWideChar(CP_UTF8, 0, q1 + 1, -1, cur, PATHMAX);
+    *q2 = '"';
+    if (!w) return;
+    for (wchar_t *c = cur; *c; c++) if (*c == L'/') *c = L'\\';
+    int rooted = (cur[0] && cur[1] == L':') || cur[0] == L'\\';
+    if (rooted) wcscpy(full, cur); else swprintf(full, PATHMAX, L"%ls\\game\\%ls", data, cur);
+    if (is_file(full)) return;
+
+    if (!find_disc(found)) {
+        swprintf(msg, sizeof msg / sizeof *msg, L"disc: %ls is missing and no .cue/.chd was found beside Baroque.exe or in a disc folder", full);
+        note(msg); return;
+    }
+    size_t dl = wcslen(data);
+    if (!_wcsnicmp(found, data, dl) && found[dl] == L'\\') swprintf(val, PATHMAX, L"../%ls", found + dl + 1);
+    else wcscpy(val, found);
+    for (wchar_t *c = val; *c; c++) if (*c == L'\\') *c = L'/';
+
+    char *o = line_new;
+    o += sprintf(o, "disc       = \"");
+    int k = WideCharToMultiByte(CP_UTF8, 0, val, -1, o, (int)(sizeof line_new - 64), NULL, NULL);
+    if (!k) return;
+    o += k - 1;
+    *o++ = '"';
+    char *after = q2 + 1;   /* keep a trailing comment or \r on the line */
+    size_t tail = le - after;
+    memcpy(o, after, tail); o += tail; *o = 0;
+
+    swprintf(tmp, PATHMAX, L"%ls.new", toml);
+    f = _wfopen(tmp, L"wb"); if (!f) return;
+    fwrite(text, 1, ls - text, f);
+    fwrite(line_new, 1, strlen(line_new), f);
+    fwrite(le, 1, strlen(le), f);
+    if (fclose(f) || !MoveFileExW(tmp, toml, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { DeleteFileW(tmp); return; }
+    swprintf(msg, sizeof msg / sizeof *msg, L"disc: %ls is missing, using %ls", full, found);
+    note(msg);
+}
+
 /* ---------------------------------------------------------- play */
 static int play(void) {
     wchar_t exe[PATHMAX], cmd[PATHMAX], dir[PATHMAX], settings[PATHMAX], log[PATHMAX];
@@ -305,5 +392,6 @@ int WINAPI wWinMain(HINSTANCE a, HINSTANCE b, PWSTR args, int show) {
     else if (!runtime_current() || !exists(L"bios\\saturn.bin") || !exists(L"game\\game.toml")) {
         if (!run_setup(L"")) return 1;
     }
+    fix_disc();
     return play();
 }
