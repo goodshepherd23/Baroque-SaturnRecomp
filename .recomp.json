@@ -1,0 +1,16 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Baroque",
+  "wikidata": "Q2749298",
+  "system": "Saturn",
+  "type": "recomp",
+  "original": {
+    "region": "Japan",
+    "serial": "T-33901G"
+  },
+  "project": "Baroque on SaturnRecomp",
+  "status": "released",
+  "targets": ["Windows"],
+  "toolchain": "SaturnRecomp",
+  "approach": "SaturnRecomp runs the original SH-2 code through a fast interpreter on real Saturn firmware; this kit adds Baroque fixes, a launcher and settings."
+}
